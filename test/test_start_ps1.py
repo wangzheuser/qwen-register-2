@@ -1,0 +1,224 @@
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+START_SCRIPT = ROOT / "start.ps1"
+POWERSHELL = shutil.which("powershell") or shutil.which("pwsh")
+
+pytestmark = pytest.mark.skipif(POWERSHELL is None, reason="PowerShell is not available")
+
+
+def run_start(input_text: str, config_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(START_SCRIPT),
+            "-DryRun",
+            "-SkipDependencyInstall",
+            "-ConfigPath",
+            str(config_path),
+        ],
+        input=input_text,
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        timeout=30,
+    )
+
+
+def assert_success(result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_start_ps1_has_valid_powershell_syntax():
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-Command",
+            "[scriptblock]::Create((Get-Content -Raw .\\start.ps1)) | Out-Null",
+        ],
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        timeout=30,
+    )
+
+    assert_success(result)
+
+
+def test_start_ps1_uses_builtin_defaults_and_saves_config(tmp_path):
+    config_path = tmp_path / "start-config.json"
+    result = run_start("\n\n\n\n\n\n\n\n", config_path)
+
+    assert_success(result)
+    assert "qwenv4.py 1 --email-provider mailtm --concurrency 1 --captcha-timeout 600 --strict" in result.stdout
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+        "count": 1,
+        "email_provider": "mailtm",
+        "api_proxy": "",
+        "concurrency": 1,
+        "captcha_timeout": 600,
+        "verbose": False,
+        "sync_qwen2api": False,
+        "qwen2api_base_url": "http://127.0.0.1:7860",
+        "qwen2api_admin_key": "admin",
+        "qwen2api_timeout": 30,
+        "strict": True,
+    }
+
+
+def test_start_ps1_saves_custom_values_then_reuses_them_as_defaults(tmp_path):
+    config_path = tmp_path / "start-config.json"
+
+    first = run_start("5\n2\nhttp://127.0.0.1:7890\ny\n4\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
+    assert_success(first)
+    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+        "count": 5,
+        "email_provider": "mailtm",
+        "api_proxy": "http://127.0.0.1:7890",
+        "concurrency": 4,
+        "captcha_timeout": 600,
+        "verbose": True,
+        "sync_qwen2api": True,
+        "qwen2api_base_url": "http://127.0.0.1:9999",
+        "qwen2api_admin_key": "secret",
+        "qwen2api_timeout": 45,
+        "strict": True,
+    }
+
+    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
+    assert_success(second)
+    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
+
+
+def test_start_ps1_plan_dry_run_input_sets_concurrency_without_verbose(tmp_path):
+    config_path = tmp_path / "start-config.json"
+    result = run_start("\n\n\n\n4\n600\n\n", config_path)
+
+    assert_success(result)
+    assert "qwenv4.py 1 --email-provider mailtm --concurrency 4 --captcha-timeout 600 --strict" in result.stdout
+    assert "--verbose" not in result.stdout
+
+
+def test_start_ps1_defaults_do_not_enable_qwen2api_sync(tmp_path):
+    config_path = tmp_path / "start-config.json"
+    result = run_start("\n\n\n\n\n\n\n\n", config_path)
+
+    assert_success(result)
+    assert "--sync-qwen2api" not in result.stdout
+    assert "--qwen2api-admin-key" not in result.stdout
+
+
+def test_start_ps1_saves_and_reuses_qwen2api_sync_values(tmp_path):
+    config_path = tmp_path / "start-config.json"
+
+    first = run_start("1\n\n\n\n1\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
+    assert_success(first)
+    assert "--sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45" in first.stdout
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["sync_qwen2api"] is True
+    assert saved["qwen2api_base_url"] == "http://127.0.0.1:9999"
+    assert saved["qwen2api_admin_key"] == "secret"
+    assert saved["qwen2api_timeout"] == 45
+
+    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
+    assert_success(second)
+    assert "--sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45" in second.stdout
+
+
+
+def test_start_ps1_skip_dependency_install_executes_python_launcher_with_args(tmp_path):
+    temp_script = tmp_path / "start.ps1"
+    temp_config = tmp_path / "start-config.json"
+    marker = tmp_path / "launched.json"
+    temp_script.write_text(START_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "qwenv4.py").write_text(
+        """
+import json
+import sys
+from pathlib import Path
+Path('launched.json').write_text(json.dumps({'argv': sys.argv[1:]}, ensure_ascii=False), encoding='utf-8')
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(temp_script),
+            "-SkipDependencyInstall",
+            "-ConfigPath",
+            str(temp_config),
+        ],
+        input="1\n\n\n\n1\n600\nn\n\n",
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=30,
+    )
+
+    assert_success(result)
+    launched = json.loads(marker.read_text(encoding="utf-8"))
+    assert launched["argv"] == [
+        "1",
+        "--email-provider",
+        "mailtm",
+        "--concurrency",
+        "1",
+        "--captcha-timeout",
+        "600",
+        "--strict",
+    ]
+
+
+def test_start_ps1_streams_qwenv4_stdout_and_preserves_exit_code(tmp_path):
+    temp_script = tmp_path / "start.ps1"
+    temp_config = tmp_path / "start-config.json"
+    temp_script.write_text(START_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "qwenv4.py").write_text(
+        """
+import sys
+print("主流程 stdout 日志")
+print("邮箱服务 stderr 日志", file=sys.stderr)
+sys.exit(7)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(temp_script),
+            "-SkipDependencyInstall",
+            "-ConfigPath",
+            str(temp_config),
+        ],
+        input="1\n\n\n\n1\n600\nn\n\n",
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=30,
+    )
+
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "主流程 stdout 日志" in result.stdout
+    assert "邮箱服务 stderr 日志" in result.stderr

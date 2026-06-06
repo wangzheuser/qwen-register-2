@@ -1,0 +1,17 @@
+.venv/
+.start-config.json
+.tmp-start-config.json
+used_emails.json
+used_emails.json.lock
+__pycache__/
+*.py[cod]
+.pytest_cache/
+qwen_accounts.txt
+qwen_accounts.json
+qwen_accounts.json.lock
+images/qwen_verified_*.png
+images/qwen_form_error.png
+test/.playwright-mcp/
+test/debug_images/
+test/downloaded_files/
+test/*.log
