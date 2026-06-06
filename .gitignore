@@ -1,5 +1,6 @@
 .venv/
 .start-config.json
+.start-camoufox-config.json
 .tmp-start-config.json
 used_emails.json
 used_emails.json.lock

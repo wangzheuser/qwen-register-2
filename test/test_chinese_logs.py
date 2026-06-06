@@ -4,7 +4,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = [
     ROOT / "qwenv4.py",
+    ROOT / "qwenv4_camoufox.py",
     ROOT / "start.ps1",
+    ROOT / "start_camoufox.ps1",
     *sorted((ROOT / "email_providers").glob("*.py")),
 ]
 
