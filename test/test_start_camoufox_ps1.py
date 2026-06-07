@@ -38,6 +38,22 @@ def assert_success(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def expected_defaults() -> dict:
+    return {
+        "count": 1,
+        "email_provider": "mailtm",
+        "api_proxy": "",
+        "concurrency": 1,
+        "captcha_timeout": 600,
+        "verbose": False,
+        "sync_qwen2api": False,
+        "qwen2api_base_url": "http://127.0.0.1:7860",
+        "qwen2api_admin_key": "admin",
+        "qwen2api_timeout": 30,
+        "strict": True,
+    }
+
+
 def test_start_camoufox_ps1_has_valid_powershell_syntax():
     result = subprocess.run(
         [
@@ -57,23 +73,14 @@ def test_start_camoufox_ps1_has_valid_powershell_syntax():
 
 def test_start_camoufox_ps1_uses_defaults_and_saves_separate_config(tmp_path):
     config_path = tmp_path / "start-camoufox-config.json"
-    result = run_start("\n\n\n\n\n\n\n\n", config_path)
+    result = run_start("\n\n\n\n\n\n\n", config_path)
 
     assert_success(result)
-    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --captcha-timeout 600 --strict" in result.stdout
-    assert json.loads(config_path.read_text(encoding="utf-8")) == {
-        "count": 1,
-        "email_provider": "mailtm",
-        "api_proxy": "",
-        "concurrency": 1,
-        "captcha_timeout": 600,
-        "verbose": False,
-        "sync_qwen2api": False,
-        "qwen2api_base_url": "http://127.0.0.1:7860",
-        "qwen2api_admin_key": "admin",
-        "qwen2api_timeout": 30,
-        "strict": True,
-    }
+    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in result.stdout
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved == expected_defaults()
+    assert "captcha_ai_api_key" not in saved
+    assert "captcha_solver" not in saved
 
 
 def test_start_camoufox_ps1_saves_and_reuses_values(tmp_path):
@@ -81,11 +88,11 @@ def test_start_camoufox_ps1_saves_and_reuses_values(tmp_path):
 
     first = run_start("3\n2\nhttp://127.0.0.1:7890\ny\n2\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
     assert_success(first)
-    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 2 --captcha-timeout 600 --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
+    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 2 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
 
-    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
+    second = run_start("\n\n\n\n\n\n\n\n\n\n", config_path)
     assert_success(second)
-    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 2 --captcha-timeout 600 --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
+    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 2 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
 
 
 def test_start_camoufox_ps1_executes_camoufox_entry_and_streams_output(tmp_path):

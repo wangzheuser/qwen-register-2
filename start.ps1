@@ -266,7 +266,7 @@ function Ensure-PythonDependencies([string]$PythonExe) {
     $checkCode = @'
 import importlib.util
 import sys
-modules = ["httpx", "bs4", "lxml", "portalocker", "playwright"]
+modules = ["httpx", "bs4", "lxml", "portalocker", "playwright", "ddddocr"]
 missing = [name for name in modules if importlib.util.find_spec(name) is None]
 if missing:
     print(",".join(missing))
@@ -377,6 +377,7 @@ try {
         $scriptArgs += @("--api-proxy", $apiProxy)
     }
     $scriptArgs += @("--concurrency", [string]$concurrency, "--captcha-timeout", [string]$captchaTimeout)
+    $scriptArgs += @("--captcha-solver", "ai", "--captcha-ai-attempts", "3", "--no-captcha-ai-fallback-manual", "--captcha-drag-backend", "os", "--captcha-drag-strategy", "fast_quadratic")
     if ($syncQwen2Api) {
         $scriptArgs += @(
             "--sync-qwen2api",
@@ -392,14 +393,22 @@ try {
 
     $displayCommand = Format-CommandForDisplay $scriptArgs
     Write-Host "最终命令: $displayCommand"
-
     if ($DryRun) {
         Write-Info "试运行模式（DryRun）已启用，不启动 qwenv4.py"
         exit 0
     }
 
     $script:InvokePythonExitCode = 0
-    Invoke-Python $pythonExe $scriptArgs
+    $previousCaptchaAiApiKey = $env:CAPTCHA_AI_API_KEY
+    try {
+        Invoke-Python $pythonExe $scriptArgs
+    } finally {
+        if ($null -eq $previousCaptchaAiApiKey) {
+            Remove-Item Env:CAPTCHA_AI_API_KEY -ErrorAction SilentlyContinue
+        } else {
+            $env:CAPTCHA_AI_API_KEY = $previousCaptchaAiApiKey
+        }
+    }
     exit $script:InvokePythonExitCode
 } catch {
     Write-Error $_.Exception.Message

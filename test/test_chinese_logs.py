@@ -8,6 +8,7 @@ FILES = [
     ROOT / "start.ps1",
     ROOT / "start_camoufox.ps1",
     *sorted((ROOT / "email_providers").glob("*.py")),
+    *sorted((ROOT / "captcha_solvers").glob("*.py")),
 ]
 
 FORBIDDEN_USER_VISIBLE_ENGLISH = [

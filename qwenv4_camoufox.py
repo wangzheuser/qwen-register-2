@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from camoufox.sync_api import Camoufox
 
@@ -22,13 +22,19 @@ from qwenv4 import (
     OUTPUT_FILE_JSON,
     OUTPUT_FILE_TXT,
     PROXY_FILE,
+    STOP_EVENT,
     ProxyRotator,
+    request_shutdown,
     build_qwen2api_sync_config,
+    build_captcha_solver_config,
+    collect_account_futures,
     extract_tokens,
     gen_first_name,
     gen_name,
     gen_password,
     get_current_ip,
+    install_aliyun_callback_probe,
+    install_aliyun_verify_success_route,
     is_generator_provider,
     maybe_sync_account_to_qwen2api,
     parse_args,
@@ -75,6 +81,9 @@ def run_single_account(account_index, total_accounts, args, proxy_str):
     qwen = None
 
     try:
+        if STOP_EVENT.is_set():
+            print(f"  🛑 {label} 已收到停止请求，跳过")
+            return False
         try:
             browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
         except Exception as e:
@@ -121,12 +130,18 @@ def run_single_account(account_index, total_accounts, args, proxy_str):
                     print(f"  🔑 {label} 密码:    {password}")
 
                     qwen = context.new_page()
+                    install_aliyun_callback_probe(qwen)
+                    if STOP_EVENT.is_set():
+                        print(f"  🛑 {label} 已收到停止请求，跳过注册")
+                        return False
                     registered = register_qwen(
                         qwen,
                         name,
                         email,
                         password,
                         captcha_timeout=args.captcha_timeout,
+                        captcha_solver_config=build_captcha_solver_config(args),
+                        label=label,
                     )
                     if not registered:
                         print(f"  ❌ {label} 注册失败，跳过...")
@@ -228,6 +243,21 @@ def main():
     minutes = args.captcha_timeout // 60
     minute_text = f" / {minutes}分钟" if minutes else ""
     print(f"🤖 滑块等待: {args.captcha_timeout}s{minute_text}")
+    if args.captcha_solver == "ai":
+        fallback_text = "启用" if not args.no_captcha_ai_fallback_manual else "禁用"
+        print(f"🧠 滑块 AI: 已启用（模型 {args.captcha_ai_model}，人工回退{fallback_text}）")
+    else:
+        print("🧠 滑块 AI: 未启用")
+    if args.captcha_record_trace:
+        print("🎥 滑块轨迹录制: 已启用（人工通过后会保存 manual_trace_*.json）")
+    if args.captcha_replay_trace:
+        print(f"🎞️ 滑块轨迹重放: {args.captcha_replay_trace}")
+    print(f"🖱️ 滑块拖动后端: {args.captcha_drag_backend}")
+    print(f"🧭 滑块拖动策略: {args.captcha_drag_strategy}")
+    if args.captcha_callback_bypass:
+        print("🧪 本地靶场回调实验: 已启用")
+    if getattr(args, "captcha_force_verify_success", False):
+        print("🧪 本地靶场 Verify 响应替换: 已启用")
     if args.sync_qwen2api:
         print(f"🔁 qwen2API 同步: 已启用（{args.qwen2api_base_url}）")
     else:
@@ -246,13 +276,14 @@ def main():
             ): index
             for index in range(1, num_accounts + 1)
         }
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                if future.result():
-                    success_count += 1
-            except Exception as e:
-                print(f"  ❌ [账号 {index}/{num_accounts}] 任务异常: {e}")
+        try:
+            success_count = collect_account_futures(futures, num_accounts)
+        finally:
+            if STOP_EVENT.is_set():
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
 
     print(f"\n{'═'*60}")
     print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")

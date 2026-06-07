@@ -1,4 +1,3 @@
-
 import json
 import shutil
 import subprocess
@@ -39,6 +38,22 @@ def assert_success(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def expected_defaults() -> dict:
+    return {
+        "count": 1,
+        "email_provider": "mailtm",
+        "api_proxy": "",
+        "concurrency": 1,
+        "captcha_timeout": 600,
+        "verbose": False,
+        "sync_qwen2api": False,
+        "qwen2api_base_url": "http://127.0.0.1:7860",
+        "qwen2api_admin_key": "admin",
+        "qwen2api_timeout": 30,
+        "strict": True,
+    }
+
+
 def test_start_ps1_has_valid_powershell_syntax():
     result = subprocess.run(
         [
@@ -58,23 +73,14 @@ def test_start_ps1_has_valid_powershell_syntax():
 
 def test_start_ps1_uses_builtin_defaults_and_saves_config(tmp_path):
     config_path = tmp_path / "start-config.json"
-    result = run_start("\n\n\n\n\n\n\n\n", config_path)
+    result = run_start("\n\n\n\n\n\n\n", config_path)
 
     assert_success(result)
-    assert "qwenv4.py 1 --email-provider mailtm --concurrency 1 --captcha-timeout 600 --strict" in result.stdout
-    assert json.loads(config_path.read_text(encoding="utf-8")) == {
-        "count": 1,
-        "email_provider": "mailtm",
-        "api_proxy": "",
-        "concurrency": 1,
-        "captcha_timeout": 600,
-        "verbose": False,
-        "sync_qwen2api": False,
-        "qwen2api_base_url": "http://127.0.0.1:7860",
-        "qwen2api_admin_key": "admin",
-        "qwen2api_timeout": 30,
-        "strict": True,
-    }
+    assert "qwenv4.py 1 --email-provider mailtm --concurrency 1 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in result.stdout
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved == expected_defaults()
+    assert "captcha_ai_api_key" not in saved
+    assert "captcha_solver" not in saved
 
 
 def test_start_ps1_saves_custom_values_then_reuses_them_as_defaults(tmp_path):
@@ -82,42 +88,41 @@ def test_start_ps1_saves_custom_values_then_reuses_them_as_defaults(tmp_path):
 
     first = run_start("5\n2\nhttp://127.0.0.1:7890\ny\n4\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
     assert_success(first)
-    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
-    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
+    expected = expected_defaults() | {
         "count": 5,
-        "email_provider": "mailtm",
         "api_proxy": "http://127.0.0.1:7890",
         "concurrency": 4,
-        "captcha_timeout": 600,
         "verbose": True,
         "sync_qwen2api": True,
         "qwen2api_base_url": "http://127.0.0.1:9999",
         "qwen2api_admin_key": "secret",
         "qwen2api_timeout": 45,
-        "strict": True,
     }
+    assert json.loads(config_path.read_text(encoding="utf-8")) == expected
 
-    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
+    second = run_start("\n\n\n\n\n\n\n\n\n\n", config_path)
     assert_success(second)
-    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
+    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
 
 
 def test_start_ps1_plan_dry_run_input_sets_concurrency_without_verbose(tmp_path):
     config_path = tmp_path / "start-config.json"
-    result = run_start("\n\n\n\n4\n600\n\n", config_path)
+    result = run_start("\n\n\n\n4\n600\nn\n\n", config_path)
 
     assert_success(result)
-    assert "qwenv4.py 1 --email-provider mailtm --concurrency 4 --captcha-timeout 600 --strict" in result.stdout
+    assert "qwenv4.py 1 --email-provider mailtm --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in result.stdout
     assert "--verbose" not in result.stdout
 
 
 def test_start_ps1_defaults_do_not_enable_qwen2api_sync(tmp_path):
     config_path = tmp_path / "start-config.json"
-    result = run_start("\n\n\n\n\n\n\n\n", config_path)
+    result = run_start("\n\n\n\n\n\n\n", config_path)
 
     assert_success(result)
     assert "--sync-qwen2api" not in result.stdout
     assert "--qwen2api-admin-key" not in result.stdout
+    assert "--captcha-solver ai" in result.stdout
 
 
 def test_start_ps1_saves_and_reuses_qwen2api_sync_values(tmp_path):
@@ -132,10 +137,9 @@ def test_start_ps1_saves_and_reuses_qwen2api_sync_values(tmp_path):
     assert saved["qwen2api_admin_key"] == "secret"
     assert saved["qwen2api_timeout"] == 45
 
-    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
+    second = run_start("\n\n\n\n\n\n\n\n\n\n", config_path)
     assert_success(second)
     assert "--sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45" in second.stdout
-
 
 
 def test_start_ps1_skip_dependency_install_executes_python_launcher_with_args(tmp_path):
@@ -180,10 +184,19 @@ Path('launched.json').write_text(json.dumps({'argv': sys.argv[1:]}, ensure_ascii
         "mailtm",
         "--concurrency",
         "1",
-        "--captcha-timeout",
-        "600",
-        "--strict",
-    ]
+            "--captcha-timeout",
+            "600",
+            "--captcha-solver",
+            "ai",
+            "--captcha-ai-attempts",
+            "3",
+            "--no-captcha-ai-fallback-manual",
+            "--captcha-drag-backend",
+            "os",
+            "--captcha-drag-strategy",
+            "fast_quadratic",
+            "--strict",
+        ]
 
 
 def test_start_ps1_streams_qwenv4_stdout_and_preserves_exit_code(tmp_path):

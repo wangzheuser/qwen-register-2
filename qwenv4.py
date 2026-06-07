@@ -15,7 +15,8 @@ import sys
 import json
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 import httpx
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -25,6 +26,18 @@ try:  # pragma: no cover - 依赖缺失时保留线程级兜底锁。
 except ImportError:  # pragma: no cover
     portalocker = None  # type: ignore
 
+from captcha_solvers.ai_slider import (
+    DEFAULT_CAPTCHA_AI_ATTEMPTS,
+    DEFAULT_CAPTCHA_AI_BASE_URL,
+    DEFAULT_CAPTCHA_AI_MODEL,
+    DEFAULT_CAPTCHA_AI_TIMEOUT,
+    CaptchaSolverConfig,
+    attach_manual_trace_recorder,
+    dump_manual_trace_recording,
+    install_aliyun_callback_probe,
+    install_aliyun_verify_success_route,
+    solve_slider_captcha,
+)
 from email_providers import EmailProviderFactory, EmailProviderError, EmailCreationError
 from email_providers.generator_email import GeneratorEmailProvider
 from email_providers.store import UsedEmailsStore
@@ -63,6 +76,8 @@ USER_AGENT = (
 
 _ACCOUNT_SAVE_LOCKS = {}
 _ACCOUNT_SAVE_LOCKS_GUARD = threading.Lock()
+STOP_EVENT = threading.Event()
+INTERRUPT_COUNT = 0
 
 
 class _FallbackAccountLock:
@@ -141,6 +156,81 @@ def parse_args(argv=None):
         help="滑块验证码等待秒数，默认: 600",
     )
     parser.add_argument(
+        "--captcha-solver",
+        choices=["manual", "ai"],
+        default="manual",
+        help="滑块验证码处理方式：manual=人工等待，ai=优先用 ddddocr 本地匹配，必要时调用 AI；默认: manual",
+    )
+    parser.add_argument(
+        "--captcha-ai-base-url",
+        default=DEFAULT_CAPTCHA_AI_BASE_URL,
+        help=f"OpenAI 兼容滑块 AI 接口地址，默认: {DEFAULT_CAPTCHA_AI_BASE_URL}",
+    )
+    parser.add_argument(
+        "--captcha-ai-api-key",
+        default=os.getenv("CAPTCHA_AI_API_KEY", ""),
+        help="滑块 AI API 密钥；也可用环境变量 CAPTCHA_AI_API_KEY",
+    )
+    parser.add_argument(
+        "--captcha-ai-model",
+        default=DEFAULT_CAPTCHA_AI_MODEL,
+        help=f"滑块 AI 模型 ID，默认: {DEFAULT_CAPTCHA_AI_MODEL}",
+    )
+    parser.add_argument(
+        "--captcha-ai-timeout",
+        type=positive_int,
+        default=DEFAULT_CAPTCHA_AI_TIMEOUT,
+        help=f"滑块 AI 请求超时秒数，默认: {DEFAULT_CAPTCHA_AI_TIMEOUT}",
+    )
+    parser.add_argument(
+        "--captcha-ai-attempts",
+        type=positive_int,
+        default=DEFAULT_CAPTCHA_AI_ATTEMPTS,
+        help=f"滑块 AI 最大尝试次数，默认: {DEFAULT_CAPTCHA_AI_ATTEMPTS}",
+    )
+    parser.add_argument(
+        "--no-captcha-ai-fallback-manual",
+        action="store_true",
+        help="AI 处理滑块失败时不回退人工等待",
+    )
+    parser.add_argument(
+        "--captcha-record-trace",
+        action="store_true",
+        help="人工处理滑块时录制轨迹和验证码网络结果，用于后续重放调试",
+    )
+    parser.add_argument(
+        "--captcha-record-only",
+        action="store_true",
+        help="只进行人工滑块轨迹录制，不运行自动滑块处理（会自动启用 --captcha-record-trace）",
+    )
+    parser.add_argument(
+        "--captcha-replay-trace",
+        default="",
+        help="读取指定人工成功轨迹 JSON，并在 AI/ ddddocr 模式下按该曲线重放",
+    )
+    parser.add_argument(
+        "--captcha-drag-backend",
+        choices=["playwright", "os"],
+        default=None,
+        help="滑块拖动后端：playwright=浏览器合成事件，os=Windows 真实鼠标事件；AI 模式默认: os",
+    )
+    parser.add_argument(
+        "--captcha-drag-strategy",
+        choices=["auto", "closed_loop", "fast_quadratic", "quadratic", "human", "ratio_human", "scaled"],
+        default=os.getenv("CAPTCHA_DRAG_STRATEGY", "fast_quadratic"),
+        help="滑块拖动策略；AI 模式默认: fast_quadratic",
+    )
+    parser.add_argument(
+        "--captcha-callback-bypass",
+        action="store_true",
+        help="本地靶场实验：尝试直接触发 AliyunCaptcha 成功回调（默认关闭）",
+    )
+    parser.add_argument(
+        "--captcha-force-verify-success",
+        action="store_true",
+        help="本地靶场实验：将 Aliyun VerifyCaptchaV2 响应替换为成功（默认关闭）",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -173,7 +263,10 @@ def parse_args(argv=None):
         default=True,
         help="严格模式：失败时跳过当前账号，不自动降级（默认启用，兼容参数）",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.captcha_drag_backend is None:
+        args.captcha_drag_backend = os.getenv("CAPTCHA_DRAG_BACKEND") or ("os" if args.captcha_solver == "ai" else "playwright")
+    return args
 
 
 def is_generator_provider(provider_type):
@@ -188,6 +281,104 @@ def build_qwen2api_sync_config(args):
         admin_key=args.qwen2api_admin_key,
         timeout=args.qwen2api_timeout,
     )
+
+
+def build_captcha_solver_config(args):
+    """从命令行参数构造滑块验证码处理配置。"""
+    captcha_solver = "manual" if getattr(args, "captcha_record_only", False) else getattr(args, "captcha_solver", "manual")
+    if getattr(args, "captcha_record_only", False):
+        setattr(args, "captcha_record_trace", True)
+    if getattr(args, "captcha_record_trace", False):
+        os.environ["CAPTCHA_RECORD_TRACE"] = "1"
+        os.environ.setdefault("CAPTCHA_DEBUG_NETWORK", "1")
+    replay_trace = str(getattr(args, "captcha_replay_trace", "") or "").strip()
+    if replay_trace:
+        os.environ["CAPTCHA_REPLAY_TRACE"] = replay_trace
+    drag_backend = str(getattr(args, "captcha_drag_backend", "") or "").strip().lower()
+    if drag_backend in {"playwright", "os"}:
+        os.environ["CAPTCHA_DRAG_BACKEND"] = drag_backend
+    drag_strategy = str(getattr(args, "captcha_drag_strategy", "") or "").strip().lower()
+    if drag_strategy and drag_strategy not in {"auto", "closed_loop"}:
+        os.environ["CAPTCHA_DRAG_STRATEGY"] = drag_strategy
+    elif drag_strategy in {"auto", "closed_loop"}:
+        os.environ.pop("CAPTCHA_DRAG_STRATEGY", None)
+    if getattr(args, "captcha_callback_bypass", False):
+        os.environ["CAPTCHA_CALLBACK_BYPASS"] = "1"
+    if getattr(args, "captcha_force_verify_success", False):
+        os.environ["CAPTCHA_FORCE_VERIFY_SUCCESS"] = "1"
+    return CaptchaSolverConfig(
+        enabled=captcha_solver == "ai",
+        base_url=getattr(args, "captcha_ai_base_url", DEFAULT_CAPTCHA_AI_BASE_URL),
+        api_key=getattr(args, "captcha_ai_api_key", os.getenv("CAPTCHA_AI_API_KEY", "")),
+        model=getattr(args, "captcha_ai_model", DEFAULT_CAPTCHA_AI_MODEL),
+        timeout=getattr(args, "captcha_ai_timeout", DEFAULT_CAPTCHA_AI_TIMEOUT),
+        attempts=getattr(args, "captcha_ai_attempts", DEFAULT_CAPTCHA_AI_ATTEMPTS),
+        fallback_manual=not getattr(args, "no_captcha_ai_fallback_manual", False),
+    )
+
+
+def request_shutdown(reason="收到中断信号"):
+    """请求所有账号任务尽快停止。"""
+    global INTERRUPT_COUNT
+    INTERRUPT_COUNT += 1
+    if not STOP_EVENT.is_set():
+        print(f"\n🛑 {reason}，正在请求所有任务停止...")
+        print("   如果浏览器或底层驱动仍未退出，可再按一次 Ctrl+C 强制结束。")
+    elif INTERRUPT_COUNT >= 2:
+        print("\n🛑 再次收到中断，强制结束当前进程。")
+        os._exit(130)
+    STOP_EVENT.set()
+
+def sleep_interruptible(seconds):
+    """可被 STOP_EVENT 打断的等待；返回 False 表示被停止请求打断。"""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        chunk = min(0.2, remaining)
+        if STOP_EVENT.wait(chunk):
+            return False
+        remaining -= chunk
+    return True
+
+
+def collect_account_futures(futures, total_accounts, poll_interval=0.5):
+    """轮询收集账号任务结果，避免 Ctrl+C 后长期阻塞在 as_completed。"""
+    success_count = 0
+    pending = set(futures)
+    while pending:
+        if STOP_EVENT.is_set():
+            for future in pending:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+            break
+
+        try:
+            done, pending = wait(pending, timeout=poll_interval, return_when=FIRST_COMPLETED)
+        except AttributeError:
+            # 单元测试可能传入只有 done/cancel/result 的轻量 fake future。
+            done = {future for future in pending if getattr(future, "done", lambda: False)()}
+            pending = pending - done
+            if not done:
+                sleep_interruptible(poll_interval)
+                continue
+
+        for future in done:
+            index = futures[future]
+            try:
+                if future.result():
+                    success_count += 1
+            except KeyboardInterrupt:
+                request_shutdown("收到 Ctrl+C")
+                for item in pending:
+                    try:
+                        item.cancel()
+                    except Exception:
+                        pass
+                return success_count
+            except Exception as e:
+                print(f"  ❌ [账号 {index}/{total_accounts}] 任务异常: {e}")
+    return success_count
 
 
 def maybe_sync_account_to_qwen2api(email, password, token, config, label=""):
@@ -443,9 +634,26 @@ def save_account(email, password, name, ip='unknown', country='unknown',
 
 def detect_captcha(page):
     """检测页面是否出现验证码"""
+    captcha_texts = ("拖动滑块完成拼图", "访问验证", "验证您是真人", "请完成以下操作")
+    selectors = (
+        "#waf_nc_block",
+        ".geetest_window",
+        "[id*='nc_']",
+        "[class*='nc_']",
+        "[class*='btn_slide']",
+        "[class*='captcha']",
+        "[class*='Captcha']",
+    )
     try:
-        captcha_exists = page.query_selector('#waf_nc_block')
-        return captcha_exists is not None
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if locator.is_visible(timeout=500):
+                    return True
+            except Exception:
+                continue
+        body_text = page.evaluate('document.body.innerText') or ''
+        return any(text in body_text for text in captcha_texts)
     except Exception:
         return False
 
@@ -480,13 +688,16 @@ def wait_for_captcha_completion(page, email, password, name, timeout=600):
     check_interval = 2  # 每2秒检查一次
 
     while time.time() - start_time < timeout:
+        if STOP_EVENT.is_set():
+            print("  🛑 已收到停止请求，结束验证码等待")
+            return False
         try:
             # 检查验证码弹窗是否还存在
             captcha_exists = detect_captcha(page)
 
             if not captcha_exists:
                 print("  ✅ 验证码已完成！")
-                time.sleep(2)  # 等待页面处理
+                sleep_interruptible(2)  # 等待页面处理
                 return True
 
             # 检查页面是否有错误
@@ -502,11 +713,14 @@ def wait_for_captcha_completion(page, email, password, name, timeout=600):
             if elapsed > 0 and elapsed % 15 == 0:
                 print(f"  ⏳ 仍在等待验证码完成... ({elapsed}s/{timeout}s)")
 
-            time.sleep(check_interval)
+            if STOP_EVENT.is_set():
+                print("  🛑 已收到停止请求，结束验证码等待")
+                return False
+            sleep_interruptible(check_interval)
 
         except Exception as e:
             print(f"  ⚠️  验证码检测错误: {e}")
-            time.sleep(check_interval)
+            sleep_interruptible(check_interval)
 
     print(f"  ⏰ 验证码等待超时 ({timeout}s)")
     return False
@@ -667,7 +881,15 @@ def wait_for_email(inbox_page, timeout=300, keywords=('qwen', 'alibaba')):
 # Qwen Registration (增强版)
 # ──────────────────────────────────────────────────────────
 
-def register_qwen(page, name, email, password, captcha_timeout=600):
+def register_qwen(
+    page,
+    name,
+    email,
+    password,
+    captcha_timeout=600,
+    captcha_solver_config=None,
+    label="",
+):
     """
     填写并提交 Qwen 注册表单（增强版，支持验证码检测）
 
@@ -718,21 +940,85 @@ def register_qwen(page, name, email, password, captcha_timeout=600):
         # 检测是否出现验证码
         if detect_captcha(page):
             print("  🤖 检测到验证码弹窗")
-            # 等待用户手动完成验证码
-            captcha_completed = wait_for_captcha_completion(
-                page,
-                email,
-                password,
-                name,
-                timeout=captcha_timeout,
-            )
+            label_prefix = f"{label} " if label else ""
+            manual_trace_records = None
+            if captcha_solver_config is not None and captcha_solver_config.enabled:
+                solver_result = solve_slider_captcha(
+                    page,
+                    captcha_solver_config,
+                    label=label,
+                    image_dir=IMAGES_DIR,
+                    stop_event=STOP_EVENT,
+                )
+                if solver_result.ok:
+                    print(f"  ✅ {label_prefix}{solver_result.message}")
+                    time.sleep(3)
+                elif captcha_solver_config.fallback_manual:
+                    print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
+                    manual_trace_records = attach_manual_trace_recorder(
+                        page,
+                        label=label,
+                        image_dir=IMAGES_DIR,
+                    )
+                    captcha_completed = wait_for_captcha_completion(
+                        page,
+                        email,
+                        password,
+                        name,
+                        timeout=captcha_timeout,
+                    )
+                    if not captcha_completed:
+                        dump_manual_trace_recording(
+                            page,
+                            manual_trace_records,
+                            label=label,
+                            image_dir=IMAGES_DIR,
+                        )
+                        print("  ❌ 验证码未完成或超时")
+                        return False
+                    dump_manual_trace_recording(
+                        page,
+                        manual_trace_records,
+                        label=label,
+                        image_dir=IMAGES_DIR,
+                    )
+                    time.sleep(3)
+                else:
+                    print(f"  ❌ {label_prefix}{solver_result.message}")
+                    return False
+            else:
+                manual_trace_records = attach_manual_trace_recorder(
+                    page,
+                    label=label,
+                    image_dir=IMAGES_DIR,
+                )
+                # 等待用户手动完成验证码
+                captcha_completed = wait_for_captcha_completion(
+                    page,
+                    email,
+                    password,
+                    name,
+                    timeout=captcha_timeout,
+                )
 
-            if not captcha_completed:
-                print("  ❌ 验证码未完成或超时")
-                return False
+                if not captcha_completed:
+                    dump_manual_trace_recording(
+                        page,
+                        manual_trace_records,
+                        label=label,
+                        image_dir=IMAGES_DIR,
+                    )
+                    print("  ❌ 验证码未完成或超时")
+                    return False
 
-            # 验证码完成后，等待页面跳转
-            time.sleep(3)
+                # 验证码完成后，等待页面跳转
+                dump_manual_trace_recording(
+                    page,
+                    manual_trace_records,
+                    label=label,
+                    image_dir=IMAGES_DIR,
+                )
+                time.sleep(3)
 
         # 检查注册结果
         body = page.evaluate('document.body.innerText') or ''
@@ -753,7 +1039,9 @@ def register_qwen(page, name, email, password, captcha_timeout=600):
             return True
 
         print(f"  ⚠️ 页面状态异常: {body[:200]}")
-        return True
+        if any(marker in body for marker in ("请完成以下操作", "验证您是真人", "访问验证")):
+            print("  ❌ 验证码仍未真正完成")
+        return False
 
     except PlaywrightTimeout as e:
         print(f"  ⚠️ 操作超时: {str(e)[:100]}")
@@ -797,7 +1085,13 @@ def run_single_account(account_index, total_accounts, args, proxy_str):
     qwen = None
 
     try:
+        if STOP_EVENT.is_set():
+            print(f"  🛑 {label} 已收到停止请求，跳过")
+            return False
         with sync_playwright() as p:
+            if STOP_EVENT.is_set():
+                print(f"  🛑 {label} 已收到停止请求，跳过")
+                return False
             try:
                 browser = p.chromium.launch(
                     headless=HEADLESS,
@@ -848,12 +1142,20 @@ def run_single_account(account_index, total_accounts, args, proxy_str):
                 print(f"  🔑 {label} 密码:    {password}")
 
                 qwen = context.new_page()
+                install_aliyun_callback_probe(qwen)
+                if getattr(args, "captcha_force_verify_success", False):
+                    install_aliyun_verify_success_route(qwen)
+                if STOP_EVENT.is_set():
+                    print(f"  🛑 {label} 已收到停止请求，跳过注册")
+                    return False
                 registered = register_qwen(
                     qwen,
                     name,
                     email,
                     password,
                     captcha_timeout=args.captcha_timeout,
+                    captcha_solver_config=build_captcha_solver_config(args),
+                    label=label,
                 )
                 if not registered:
                     print(f"  ❌ {label} 注册失败，跳过...")
@@ -930,6 +1232,20 @@ def run_single_account(account_index, total_accounts, args, proxy_str):
 def main():
     """主函数 - 自动化注册流程"""
 
+    STOP_EVENT.clear()
+    global INTERRUPT_COUNT
+    INTERRUPT_COUNT = 0
+    previous_sigint = None
+    try:
+        previous_sigint = signal.getsignal(signal.SIGINT)
+
+        def _handle_sigint(_signum, _frame):
+            request_shutdown("收到 Ctrl+C")
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+    except Exception:
+        previous_sigint = None
+
     args = parse_args()
     num_accounts = args.count
     if num_accounts is None:
@@ -952,6 +1268,23 @@ def main():
     minutes = args.captcha_timeout // 60
     minute_text = f" / {minutes}分钟" if minutes else ""
     print(f"🤖 滑块等待: {args.captcha_timeout}s{minute_text}")
+    if args.captcha_record_only:
+        print("🧠 滑块自动处理: 已禁用（只录制人工轨迹）")
+    elif args.captcha_solver == "ai":
+        fallback_text = "启用" if not args.no_captcha_ai_fallback_manual else "禁用"
+        print(f"🧠 滑块自动处理: 已启用（优先 ddddocr，AI 模型 {args.captcha_ai_model}，人工回退{fallback_text}）")
+    else:
+        print("🧠 滑块自动处理: 未启用")
+    if args.captcha_record_trace or args.captcha_record_only:
+        print("🎥 滑块轨迹录制: 已启用（人工通过后会保存 manual_trace_*.json）")
+    if args.captcha_replay_trace:
+        print(f"🎞️ 滑块轨迹重放: {args.captcha_replay_trace}")
+    print(f"🖱️ 滑块拖动后端: {args.captcha_drag_backend}")
+    print(f"🧭 滑块拖动策略: {args.captcha_drag_strategy}")
+    if args.captcha_callback_bypass:
+        print("🧪 本地靶场回调实验: 已启用")
+    if args.captcha_force_verify_success:
+        print("🧪 本地靶场 Verify 响应替换: 已启用")
     if args.sync_qwen2api:
         print(f"🔁 qwen2API 同步: 已启用（{args.qwen2api_base_url}）")
     else:
@@ -959,31 +1292,39 @@ def main():
     print("🔒 严格模式: 已启用（不会自动降级）\n")
 
     success_count = 0
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = {
-            executor.submit(
-                run_single_account,
-                index,
-                num_accounts,
-                args,
-                proxy_assignments[index - 1],
-            ): index
-            for index in range(1, num_accounts + 1)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
+    try:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = {
+                executor.submit(
+                    run_single_account,
+                    index,
+                    num_accounts,
+                    args,
+                    proxy_assignments[index - 1],
+                ): index
+                for index in range(1, num_accounts + 1)
+            }
             try:
-                if future.result():
-                    success_count += 1
-            except Exception as e:
-                print(f"  ❌ [账号 {index}/{num_accounts}] 任务异常: {e}")
+                success_count = collect_account_futures(futures, num_accounts)
+            finally:
+                if STOP_EVENT.is_set():
+                    for future in futures:
+                        future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
 
-    print(f"\n{'═'*60}")
-    print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")
-    print("💾 结果保存到:")
-    print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
-    print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
-    print(f"{'═'*60}")
+        print(f"\n{'═'*60}")
+        print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")
+        print("💾 结果保存到:")
+        print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
+        print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
+        print(f"{'═'*60}")
+    finally:
+        if previous_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, previous_sigint)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

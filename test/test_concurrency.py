@@ -115,6 +115,8 @@ def test_parse_args_rejects_non_positive_captcha_timeout():
 
 
 def test_register_qwen_passes_captcha_timeout(monkeypatch):
+    monkeypatch.setenv("CAPTCHA_RECORD_TRACE", "1")
+
     class DummyLocator:
         def scroll_into_view_if_needed(self):
             pass
@@ -226,3 +228,48 @@ def test_save_account_concurrent_writes_keep_json_valid(tmp_path, monkeypatch):
     assert len(data) == 20
     assert {item["email"] for item in data} == {f"user{i}@example.com" for i in range(20)}
     assert len(txt_path.read_text(encoding="utf-8").strip().splitlines()) == 20
+
+
+
+def test_wait_for_captcha_completion_returns_quickly_when_stop_set(monkeypatch):
+    class Page:
+        def __init__(self):
+            self.detect_calls = 0
+
+    page = Page()
+    qwenv4.STOP_EVENT.clear()
+
+    def fake_detect(_page):
+        qwenv4.STOP_EVENT.set()
+        return True
+
+    slept = {"seconds": 0}
+    monkeypatch.setattr(qwenv4, "detect_captcha", fake_detect)
+    monkeypatch.setattr(qwenv4.time, "sleep", lambda seconds: slept.__setitem__("seconds", slept["seconds"] + seconds))
+
+    assert qwenv4.wait_for_captcha_completion(page, "e@example.com", "pw", "name", timeout=30) is False
+    assert slept["seconds"] == 0
+    qwenv4.STOP_EVENT.clear()
+
+
+def test_collect_futures_honors_stop_without_waiting_for_unfinished_future(monkeypatch):
+    class PendingFuture:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    pending = PendingFuture()
+    qwenv4.STOP_EVENT.set()
+    try:
+        success = qwenv4.collect_account_futures({pending: 1}, 1, poll_interval=0)
+    finally:
+        qwenv4.STOP_EVENT.clear()
+
+    assert success == 0
+    assert pending.cancelled is True
