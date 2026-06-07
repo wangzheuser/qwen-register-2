@@ -16,6 +16,48 @@ def test_parse_args_accepts_concurrency_and_captcha_timeout():
     assert args.captcha_timeout == 600
 
 
+
+def test_parse_args_accepts_browser_proxy_template():
+    proxy = "http://baokemeng.{uuid}:testpass@127.0.0.1:9200"
+    args = qwenv4.parse_args(["1", "--browser-proxy", proxy])
+
+    assert args.browser_proxy == proxy
+
+
+def test_build_browser_proxy_replaces_uuid_each_time_and_hides_password():
+    template = "http://baokemeng.{uuid}:testpass@127.0.0.1:9200"
+
+    first = qwenv4.build_browser_proxy(template)
+    second = qwenv4.build_browser_proxy(template)
+
+    assert first["proxy"] == {
+        "server": "http://127.0.0.1:9200",
+        "username": first["username"],
+        "password": "testpass",
+    }
+    assert first["username"].startswith("baokemeng.")
+    assert second["username"].startswith("baokemeng.")
+    first_uuid = first["username"].removeprefix("baokemeng.")
+    second_uuid = second["username"].removeprefix("baokemeng.")
+    assert len(first_uuid) == 32
+    assert "-" not in first_uuid
+    assert first_uuid != second_uuid
+    assert first["display"] == f"http://{first['username']}@127.0.0.1:9200"
+    assert "testpass" not in first["display"]
+
+
+def test_build_browser_proxy_accepts_proxy_without_auth():
+    result = qwenv4.build_browser_proxy("http://127.0.0.1:9200")
+
+    assert result["proxy"] == {"server": "http://127.0.0.1:9200"}
+    assert result["display"] == "http://127.0.0.1:9200"
+
+
+def test_build_browser_proxy_rejects_invalid_format():
+    with pytest.raises(ValueError, match="浏览器代理格式无效"):
+        qwenv4.build_browser_proxy("not-a-proxy")
+
+
 def test_parse_args_defaults_to_mailtm_provider():
     args = qwenv4.parse_args(["1"])
 
@@ -273,3 +315,25 @@ def test_collect_futures_honors_stop_without_waiting_for_unfinished_future(monke
 
     assert success == 0
     assert pending.cancelled is True
+
+
+
+def test_request_shutdown_forces_exit_after_short_grace(monkeypatch):
+    exits = []
+    monkeypatch.setattr(qwenv4, "INTERRUPT_FORCE_EXIT_SECONDS", 0.01)
+    monkeypatch.setattr(qwenv4.os, "_exit", lambda code: exits.append(code))
+    qwenv4.STOP_EVENT.clear()
+    qwenv4.INTERRUPT_COUNT = 0
+
+    qwenv4.request_shutdown("测试 Ctrl+C")
+
+    deadline = time.time() + 1
+    while time.time() < deadline and not exits:
+        time.sleep(0.01)
+
+    try:
+        assert exits == [130]
+        assert qwenv4.STOP_EVENT.is_set()
+    finally:
+        qwenv4.STOP_EVENT.clear()
+        qwenv4.INTERRUPT_COUNT = 0

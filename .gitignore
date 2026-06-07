@@ -23,3 +23,4 @@ test/debug_images/
 test/downloaded_files/
 test/*.log
 .start-captcha-config.json
+proxy.txt

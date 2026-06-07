@@ -1,6 +1,8 @@
 import json
+import signal
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,7 @@ def expected_defaults() -> dict:
         "count": 1,
         "email_provider": "mailtm",
         "api_proxy": "",
+        "browser_proxy": "",
         "concurrency": 1,
         "captcha_timeout": 600,
         "verbose": False,
@@ -73,7 +76,7 @@ def test_start_ps1_has_valid_powershell_syntax():
 
 def test_start_ps1_uses_builtin_defaults_and_saves_config(tmp_path):
     config_path = tmp_path / "start-config.json"
-    result = run_start("\n\n\n\n\n\n\n", config_path)
+    result = run_start("\n\n\n\n\n\n\n\n", config_path)
 
     assert_success(result)
     assert "qwenv4.py 1 --email-provider mailtm --concurrency 1 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in result.stdout
@@ -86,12 +89,13 @@ def test_start_ps1_uses_builtin_defaults_and_saves_config(tmp_path):
 def test_start_ps1_saves_custom_values_then_reuses_them_as_defaults(tmp_path):
     config_path = tmp_path / "start-config.json"
 
-    first = run_start("5\n2\nhttp://127.0.0.1:7890\ny\n4\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
+    first = run_start("5\n2\nhttp://127.0.0.1:7890\nhttp://baokemeng.{uuid}:testpass@127.0.0.1:9200\ny\n4\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
     assert_success(first)
-    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
+    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --browser-proxy http://baokemeng.{uuid}:testpass@127.0.0.1:9200 --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in first.stdout
     expected = expected_defaults() | {
         "count": 5,
         "api_proxy": "http://127.0.0.1:7890",
+        "browser_proxy": "http://baokemeng.{uuid}:testpass@127.0.0.1:9200",
         "concurrency": 4,
         "verbose": True,
         "sync_qwen2api": True,
@@ -101,14 +105,14 @@ def test_start_ps1_saves_custom_values_then_reuses_them_as_defaults(tmp_path):
     }
     assert json.loads(config_path.read_text(encoding="utf-8")) == expected
 
-    second = run_start("\n\n\n\n\n\n\n\n\n\n", config_path)
+    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
     assert_success(second)
-    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
+    assert "qwenv4.py 5 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --browser-proxy http://baokemeng.{uuid}:testpass@127.0.0.1:9200 --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in second.stdout
 
 
 def test_start_ps1_plan_dry_run_input_sets_concurrency_without_verbose(tmp_path):
     config_path = tmp_path / "start-config.json"
-    result = run_start("\n\n\n\n4\n600\nn\n\n", config_path)
+    result = run_start("\n\n\n\n\n4\n600\nn\n\n", config_path)
 
     assert_success(result)
     assert "qwenv4.py 1 --email-provider mailtm --concurrency 4 --captcha-timeout 600 --captcha-solver ai --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in result.stdout
@@ -117,18 +121,19 @@ def test_start_ps1_plan_dry_run_input_sets_concurrency_without_verbose(tmp_path)
 
 def test_start_ps1_defaults_do_not_enable_qwen2api_sync(tmp_path):
     config_path = tmp_path / "start-config.json"
-    result = run_start("\n\n\n\n\n\n\n", config_path)
+    result = run_start("\n\n\n\n\n\n\n\n", config_path)
 
     assert_success(result)
     assert "--sync-qwen2api" not in result.stdout
     assert "--qwen2api-admin-key" not in result.stdout
     assert "--captcha-solver ai" in result.stdout
+    assert "--browser-proxy" not in result.stdout
 
 
 def test_start_ps1_saves_and_reuses_qwen2api_sync_values(tmp_path):
     config_path = tmp_path / "start-config.json"
 
-    first = run_start("1\n\n\n\n1\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
+    first = run_start("1\n\n\n\n\n1\n600\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
     assert_success(first)
     assert "--sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45" in first.stdout
     saved = json.loads(config_path.read_text(encoding="utf-8"))
@@ -137,7 +142,7 @@ def test_start_ps1_saves_and_reuses_qwen2api_sync_values(tmp_path):
     assert saved["qwen2api_admin_key"] == "secret"
     assert saved["qwen2api_timeout"] == 45
 
-    second = run_start("\n\n\n\n\n\n\n\n\n\n", config_path)
+    second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
     assert_success(second)
     assert "--sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45" in second.stdout
 
@@ -169,7 +174,7 @@ Path('launched.json').write_text(json.dumps({'argv': sys.argv[1:]}, ensure_ascii
             "-ConfigPath",
             str(temp_config),
         ],
-        input="1\n\n\n\n1\n600\nn\n\n",
+        input="1\n\n\n\n\n1\n600\nn\n\n",
         text=True,
         capture_output=True,
         cwd=tmp_path,
@@ -225,7 +230,7 @@ sys.exit(7)
             "-ConfigPath",
             str(temp_config),
         ],
-        input="1\n\n\n\n1\n600\nn\n\n",
+        input="1\n\n\n\n\n1\n600\nn\n\n",
         text=True,
         capture_output=True,
         cwd=tmp_path,

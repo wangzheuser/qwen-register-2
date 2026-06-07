@@ -44,6 +44,7 @@ function Load-StartConfig([string]$Path) {
         count = 1
         email_provider = "mailtm"
         api_proxy = ""
+        browser_proxy = ""
         concurrency = 1
         captcha_timeout = 600
         verbose = $false
@@ -57,7 +58,7 @@ function Load-StartConfig([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
         try {
             $loaded = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($key in @("count", "email_provider", "api_proxy", "concurrency", "captcha_timeout", "verbose", "sync_qwen2api", "qwen2api_base_url", "qwen2api_admin_key", "qwen2api_timeout", "strict")) {
+            foreach ($key in @("count", "email_provider", "api_proxy", "browser_proxy", "concurrency", "captcha_timeout", "verbose", "sync_qwen2api", "qwen2api_base_url", "qwen2api_admin_key", "qwen2api_timeout", "strict")) {
                 if ($loaded.PSObject.Properties.Name -contains $key) {
                     $config[$key] = $loaded.$key
                 }
@@ -79,6 +80,7 @@ function Save-StartConfig([string]$Path, [hashtable]$Config) {
         count = [int]$Config.count
         email_provider = [string]$Config.email_provider
         api_proxy = [string]$Config.api_proxy
+        browser_proxy = [string]$Config.browser_proxy
         concurrency = [int]$Config.concurrency
         captcha_timeout = [int]$Config.captcha_timeout
         verbose = [bool]$Config.verbose
@@ -230,26 +232,119 @@ function Ensure-VenvPython() {
     return $VenvPython
 }
 
-function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
-    $previousPythonUnbuffered = $env:PYTHONUNBUFFERED
-    $env:PYTHONUNBUFFERED = "1"
-    try {
-        if ($PythonExe.Contains(" ") -and -not (Test-Path -LiteralPath $PythonExe)) {
-            $parts = $PythonExe.Split(" ", 2)
-            $launcherArgs = @()
-            if ($parts.Count -gt 1 -and -not [string]::IsNullOrWhiteSpace($parts[1])) {
-                $launcherArgs = @($parts[1] -split "\s+")
-            }
-            & $parts[0] @launcherArgs @Arguments
-        } else {
-            & $PythonExe @Arguments
+function Resolve-PythonInvocation([string]$PythonExe) {
+    if ($PythonExe.Contains(" ") -and -not (Test-Path -LiteralPath $PythonExe)) {
+        $parts = $PythonExe.Split(" ", 2)
+        $launcherArgs = @()
+        if ($parts.Count -gt 1 -and -not [string]::IsNullOrWhiteSpace($parts[1])) {
+            $launcherArgs = @($parts[1] -split "\s+")
         }
-        $script:InvokePythonExitCode = $LASTEXITCODE
-    } finally {
-        if ($null -eq $previousPythonUnbuffered) {
-            Remove-Item Env:PYTHONUNBUFFERED -ErrorAction SilentlyContinue
+        return @{ Command = $parts[0]; Args = $launcherArgs }
+    }
+    return @{ Command = $PythonExe; Args = @() }
+}
+
+function Quote-ProcessArgument([string]$Argument) {
+    if ($null -eq $Argument) {
+        return '""'
+    }
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    return '"' + ($Argument -replace '\', '\' -replace '"', '\"') + '"'
+}
+
+function Join-ProcessArguments([string[]]$Arguments) {
+    return (($Arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join " ")
+}
+
+function Stop-ProcessTree([int]$ProcessId) {
+    $children = @()
+    try {
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    } catch {
+        try {
+            $children = Get-WmiObject Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
+        } catch {
+            $children = @()
+        }
+    }
+
+    foreach ($child in @($children)) {
+        if ($null -ne $child.ProcessId) {
+            Stop-ProcessTree -ProcessId ([int]$child.ProcessId)
+        }
+    }
+
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -ne $process) {
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+    }
+}
+
+function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
+    $invocation = Resolve-PythonInvocation $PythonExe
+    $allArguments = @($invocation.Args) + @($Arguments)
+    $process = $null
+    $handler = $null
+    $script:InvokePythonExitCode = 130
+    $script:CancelRequested = $false
+    try {
+        $handler = [ConsoleCancelEventHandler]{
+            param($sender, $eventArgs)
+            $eventArgs.Cancel = $true
+            $script:CancelRequested = $true
+            try {
+                if ($script:CurrentPythonProcessId) {
+                    Write-Host ""
+                    Write-Info "收到 Ctrl+C，正在终止 Python 子进程及其浏览器进程..."
+                    Stop-ProcessTree -ProcessId ([int]$script:CurrentPythonProcessId)
+                }
+            } catch {
+            }
+        }
+        [Console]::add_CancelKeyPress($handler)
+
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = [string]$invocation.Command
+        $startInfo.Arguments = Join-ProcessArguments $allArguments
+        $startInfo.WorkingDirectory = $ProjectRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $false
+        $startInfo.RedirectStandardError = $false
+        $startInfo.EnvironmentVariables["PYTHONUNBUFFERED"] = "1"
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        $script:CurrentPythonProcessId = $process.Id
+
+        while (-not $process.HasExited) {
+            if ($script:CancelRequested) {
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($process.HasExited) {
+            $script:InvokePythonExitCode = $process.ExitCode
         } else {
-            $env:PYTHONUNBUFFERED = $previousPythonUnbuffered
+            $script:InvokePythonExitCode = 130
+        }
+    } finally {
+        if ($null -ne $handler) {
+            [Console]::remove_CancelKeyPress($handler)
+        }
+        if ($null -ne $process -and -not $process.HasExited) {
+            Write-Info "正在终止 Python 子进程及其浏览器进程..."
+            Stop-ProcessTree -ProcessId $process.Id
+            $script:InvokePythonExitCode = 130
+        }
+        $script:CurrentPythonProcessId = $null
+        if ($null -ne $process) {
+            $process.Dispose()
         }
     }
 }
@@ -338,6 +433,7 @@ try {
     $count = Prompt-PositiveInt "账号数量" ([int]$config.count)
     $provider = Prompt-Provider ([string]$config.email_provider)
     $apiProxy = Prompt-String "API 代理（输入 none 可清空）" ([string]$config.api_proxy)
+    $browserProxy = Prompt-String "浏览器代理（输入 none 可清空）" ([string]$config.browser_proxy)
     $verbose = Prompt-Bool "启用详细日志?" ([bool]$config.verbose)
     $concurrency = Prompt-RangedInt "并发数量" ([int]$config.concurrency) 1 10
     $captchaTimeout = Prompt-PositiveInt "滑块验证等待秒数" ([int]$config.captcha_timeout)
@@ -360,6 +456,7 @@ try {
         count = $count
         email_provider = $provider
         api_proxy = $apiProxy
+        browser_proxy = $browserProxy
         concurrency = $concurrency
         captcha_timeout = $captchaTimeout
         verbose = $verbose
@@ -375,6 +472,9 @@ try {
     $scriptArgs = @("qwenv4.py", [string]$count, "--email-provider", $provider)
     if (-not [string]::IsNullOrWhiteSpace($apiProxy)) {
         $scriptArgs += @("--api-proxy", $apiProxy)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($browserProxy)) {
+        $scriptArgs += @("--browser-proxy", $browserProxy)
     }
     $scriptArgs += @("--concurrency", [string]$concurrency, "--captcha-timeout", [string]$captchaTimeout)
     $scriptArgs += @("--captcha-solver", "ai", "--captcha-ai-attempts", "3", "--no-captcha-ai-fallback-manual", "--captcha-drag-backend", "os", "--captcha-drag-strategy", "fast_quadratic")
@@ -410,6 +510,12 @@ try {
         }
     }
     exit $script:InvokePythonExitCode
+} catch [System.Management.Automation.PipelineStoppedException] {
+    if ($script:CurrentPythonProcessId) {
+        Write-Info "正在终止 Python 子进程及其浏览器进程..."
+        Stop-ProcessTree -ProcessId ([int]$script:CurrentPythonProcessId)
+    }
+    exit 130
 } catch {
     Write-Error $_.Exception.Message
     exit 1

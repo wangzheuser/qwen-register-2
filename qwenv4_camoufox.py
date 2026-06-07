@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,9 +22,8 @@ from qwenv4 import (
     IMAGES_DIR,
     OUTPUT_FILE_JSON,
     OUTPUT_FILE_TXT,
-    PROXY_FILE,
     STOP_EVENT,
-    ProxyRotator,
+    build_browser_proxy,
     request_shutdown,
     build_qwen2api_sync_config,
     build_captcha_solver_config,
@@ -61,17 +61,21 @@ def _camoufox_launch_kwargs(proxy_dict):
     return kwargs
 
 
-def run_single_account(account_index, total_accounts, args, proxy_str):
+def run_single_account(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号注册任务；每个线程独立创建 Camoufox 实例。"""
     label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
     print(f"🦊 {label} Camoufox")
     print(f"{'═'*60}")
 
-    proxy_dict = ProxyRotator.parse_proxy(proxy_str) if proxy_str else None
+    try:
+        proxy_info = build_browser_proxy(getattr(args, "browser_proxy", "") or proxy_str)
+    except ValueError as e:
+        print(f"  ❌ {label} {e}")
+        return False
+    proxy_dict = proxy_info["proxy"]
     if proxy_dict:
-        parts = proxy_str.split(":")
-        print(f"  🌐 {label} 浏览器代理: {parts[0]}:{parts[1]}")
+        print(f"  🌐 {label} 浏览器代理: {proxy_info['display']}")
     else:
         print(f"  🌐 {label} 未使用浏览器代理（直连）")
 
@@ -221,6 +225,12 @@ def run_single_account(account_index, total_accounts, args, proxy_str):
 
 def main():
     """主函数 - Camoufox 自动化注册流程。"""
+    STOP_EVENT.clear()
+    try:
+        signal.signal(signal.SIGINT, lambda _signum, _frame: request_shutdown("收到 Ctrl+C"))
+    except Exception:
+        pass
+
     args = parse_args()
     num_accounts = args.count
     if num_accounts is None:
@@ -232,13 +242,12 @@ def main():
 
     os.makedirs(IMAGES_DIR, exist_ok=True)
 
-    proxy_rotator = ProxyRotator(PROXY_FILE)
-    proxy_assignments = [proxy_rotator.get_next() for _ in range(num_accounts)]
-
     print(f"\n🎯 准备使用 Camoufox 创建 {num_accounts} 个 Qwen 账号...")
     print(f"📮 邮箱服务: {args.email_provider}")
     if args.api_proxy and not is_generator_provider(args.email_provider):
         print(f"🔌 API 代理: {args.api_proxy}")
+    if args.browser_proxy:
+        print("🌐 浏览器代理: 已配置（每个账号启动时动态解析）")
     print(f"🚦 并发数量: {args.concurrency}")
     minutes = args.captcha_timeout // 60
     minute_text = f" / {minutes}分钟" if minutes else ""
@@ -272,7 +281,7 @@ def main():
                 index,
                 num_accounts,
                 args,
-                proxy_assignments[index - 1],
+                None,
             ): index
             for index in range(1, num_accounts + 1)
         }

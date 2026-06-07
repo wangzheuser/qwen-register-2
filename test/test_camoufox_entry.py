@@ -87,6 +87,7 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
         email_provider="mailtm",
         verbose=False,
         api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
         captcha_timeout=600,
         sync_qwen2api=False,
         qwen2api_base_url="http://127.0.0.1:7860",
@@ -113,7 +114,7 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
     monkeypatch.setattr(qwenv4_camoufox, "maybe_sync_account_to_qwen2api", lambda **_kwargs: None)
     monkeypatch.setattr(qwenv4_camoufox.time, "sleep", lambda _seconds: None)
 
-    assert qwenv4_camoufox.run_single_account(1, 1, args, "127.0.0.1:7890") is True
+    assert qwenv4_camoufox.run_single_account(1, 1, args, None) is True
 
     launch_kwargs = seen["launch_kwargs"]
     assert launch_kwargs["headless"] is False
@@ -138,6 +139,7 @@ def test_camoufox_worker_returns_false_when_browser_launch_fails(monkeypatch, ca
         email_provider="mailtm",
         verbose=False,
         api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
         captcha_timeout=600,
         sync_qwen2api=False,
         qwen2api_base_url="http://127.0.0.1:7860",
@@ -168,6 +170,7 @@ def test_camoufox_worker_returns_false_when_browser_enter_fails(monkeypatch, cap
         email_provider="mailtm",
         verbose=False,
         api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
         captcha_timeout=600,
         sync_qwen2api=False,
         qwen2api_base_url="http://127.0.0.1:7860",

@@ -2,7 +2,7 @@
 """
 Qwen 自动注册脚本 v3 - 增强 Token 提取
 使用临时邮箱自动完成 Qwen 注册与验证。
-支持代理轮换、验证码检测和认证令牌提取。
+支持浏览器代理、验证码检测和认证令牌提取。
 
 Author: wangqiupei
 """
@@ -16,6 +16,8 @@ import json
 import os
 import threading
 import signal
+import urllib.parse
+import uuid
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 import httpx
@@ -58,7 +60,6 @@ EMAIL_BASE_URL = "https://generator.email"
 EMAIL_DOMAIN = "halyang.my.id"
 OUTPUT_FILE_TXT = "qwen_accounts.txt"
 OUTPUT_FILE_JSON = "qwen_accounts.json"
-PROXY_FILE = "proxy.txt"
 IMAGES_DIR = "images"
 HEADLESS = False  # 必须为 False 以支持手动完成验证码
 
@@ -142,6 +143,11 @@ def parse_args(argv=None):
         "--api-proxy",
         default=None,
         help="API 请求代理地址，仅 Mail.tm / Mailporary 使用，如 http://127.0.0.1:7890",
+    )
+    parser.add_argument(
+        "--browser-proxy",
+        default="",
+        help="浏览器代理地址，可包含 {uuid} 模板，如 http://user.{uuid}:pass@127.0.0.1:9200",
     )
     parser.add_argument(
         "--concurrency",
@@ -317,15 +323,30 @@ def build_captcha_solver_config(args):
     )
 
 
+INTERRUPT_FORCE_EXIT_SECONDS = 5
+
+
+def _force_exit_after_interrupt(timeout=None):
+    """中断后给清理流程一个短窗口，避免浏览器/驱动卡死导致 Ctrl+C 无法退出。"""
+    delay = INTERRUPT_FORCE_EXIT_SECONDS if timeout is None else timeout
+    try:
+        time.sleep(max(0.0, float(delay)))
+    except Exception:
+        time.sleep(5)
+    print("\n🛑 中断清理超时，强制结束当前进程。", flush=True)
+    os._exit(130)
+
+
 def request_shutdown(reason="收到中断信号"):
     """请求所有账号任务尽快停止。"""
     global INTERRUPT_COUNT
     INTERRUPT_COUNT += 1
     if not STOP_EVENT.is_set():
-        print(f"\n🛑 {reason}，正在请求所有任务停止...")
-        print("   如果浏览器或底层驱动仍未退出，可再按一次 Ctrl+C 强制结束。")
+        print(f"\n🛑 {reason}，正在请求所有任务停止...", flush=True)
+        print("   若浏览器或底层驱动未及时退出，将在数秒后自动强制结束。", flush=True)
+        threading.Thread(target=_force_exit_after_interrupt, daemon=True).start()
     elif INTERRUPT_COUNT >= 2:
-        print("\n🛑 再次收到中断，强制结束当前进程。")
+        print("\n🛑 再次收到中断，强制结束当前进程。", flush=True)
         os._exit(130)
     STOP_EVENT.set()
 
@@ -401,72 +422,37 @@ def maybe_sync_account_to_qwen2api(email, password, token, config, label=""):
     return result
 
 # ──────────────────────────────────────────────────────────
-# 代理管理
+# 浏览器代理
 # ──────────────────────────────────────────────────────────
 
-class ProxyRotator:
-    """代理轮换管理器"""
+def build_browser_proxy(proxy_template):
+    """将浏览器代理模板解析为 Playwright/Camoufox 兼容配置。"""
+    raw_template = str(proxy_template or "").strip()
+    if not raw_template:
+        return {"proxy": None, "display": "", "resolved": "", "username": ""}
 
-    def __init__(self, proxy_file=PROXY_FILE):
-        self.proxies = []
-        self.current_index = 0
-        self._lock = threading.Lock()
-        self.load_proxies(proxy_file)
+    resolved = raw_template.replace("{uuid}", uuid.uuid4().hex)
+    parsed = urllib.parse.urlparse(resolved)
+    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname or not parsed.port:
+        raise ValueError("浏览器代理格式无效，请使用 http://user:pass@host:port 或 http://host:port")
 
-    def load_proxies(self, proxy_file):
-        """从文件加载代理。格式: hostname:port:username:password 或 hostname:port"""
-        try:
-            with open(proxy_file, 'r') as f:
-                lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+    proxy = {"server": server}
+    username = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
+    if username:
+        proxy["username"] = username
+        proxy["password"] = password
+        display = f"{parsed.scheme}://{username}@{parsed.hostname}:{parsed.port}"
+    else:
+        display = server
 
-            if not lines:
-                print(f"⚠️  在 {proxy_file} 中未找到代理")
-                return
-
-            self.proxies = lines
-            print(f"✅ 已加载 {len(self.proxies)} 个代理")
-            for i, p in enumerate(self.proxies[:3]):
-                parts = p.split(':')
-                print(f"   [{i+1}] {parts[0]}:{parts[1]}")
-            if len(self.proxies) > 3:
-                print(f"   ... 以及另外 {len(self.proxies) - 3} 个")
-
-        except FileNotFoundError:
-            print(f"⚠️  未找到 {proxy_file}，将不使用代理运行。")
-            self.proxies = []
-
-    def get_next(self):
-        """获取下一个代理"""
-        if not self.proxies:
-            return None
-
-        with self._lock:
-            proxy = self.proxies[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.proxies)
-            return proxy
-
-    @staticmethod
-    def parse_proxy(proxy_str):
-        """将代理字符串解析为 Playwright 格式的字典"""
-        if not proxy_str:
-            return None
-
-        parts = proxy_str.split(':')
-        if len(parts) == 4:
-            hostname, port, username, password = parts
-            return {
-                'server': f'http://{hostname}:{port}',
-                'username': username,
-                'password': password,
-            }
-        elif len(parts) == 2:
-            hostname, port = parts
-            return {
-                'server': f'http://{hostname}:{port}',
-            }
-        else:
-            print(f"⚠️  代理格式无效: {proxy_str}")
-            return None
+    return {
+        "proxy": proxy,
+        "display": display,
+        "resolved": resolved,
+        "username": username,
+    }
 
 # ──────────────────────────────────────────────────────────
 # Helpers
@@ -1066,17 +1052,21 @@ def register_qwen(
 # Main Loop（并发版）
 # ──────────────────────────────────────────────────────────
 
-def run_single_account(account_index, total_accounts, args, proxy_str):
+def run_single_account(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号注册任务；每个线程独立创建 Playwright 实例。"""
     label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
     print(f"🔢 {label}")
     print(f"{'═'*60}")
 
-    proxy_dict = ProxyRotator.parse_proxy(proxy_str) if proxy_str else None
+    try:
+        proxy_info = build_browser_proxy(getattr(args, "browser_proxy", "") or proxy_str)
+    except ValueError as e:
+        print(f"  ❌ {label} {e}")
+        return False
+    proxy_dict = proxy_info["proxy"]
     if proxy_dict:
-        parts = proxy_str.split(':')
-        print(f"  🌐 {label} 浏览器代理: {parts[0]}:{parts[1]}")
+        print(f"  🌐 {label} 浏览器代理: {proxy_info['display']}")
     else:
         print(f"  🌐 {label} 未使用浏览器代理（直连）")
 
@@ -1257,13 +1247,12 @@ def main():
 
     os.makedirs(IMAGES_DIR, exist_ok=True)
 
-    proxy_rotator = ProxyRotator(PROXY_FILE)
-    proxy_assignments = [proxy_rotator.get_next() for _ in range(num_accounts)]
-
     print(f"\n🎯 准备创建 {num_accounts} 个 Qwen 账号...")
     print(f"📮 邮箱服务: {args.email_provider}")
     if args.api_proxy and not is_generator_provider(args.email_provider):
         print(f"🔌 API 代理: {args.api_proxy}")
+    if args.browser_proxy:
+        print("🌐 浏览器代理: 已配置（每个账号启动时动态解析）")
     print(f"🚦 并发数量: {args.concurrency}")
     minutes = args.captcha_timeout // 60
     minute_text = f" / {minutes}分钟" if minutes else ""
@@ -1300,7 +1289,7 @@ def main():
                     index,
                     num_accounts,
                     args,
-                    proxy_assignments[index - 1],
+                    None,
                 ): index
                 for index in range(1, num_accounts + 1)
             }
