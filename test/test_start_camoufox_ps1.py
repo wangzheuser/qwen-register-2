@@ -132,3 +132,26 @@ sys.exit(7)
     assert result.returncode == 7, result.stdout + result.stderr
     assert "Camoufox stdout 日志" in result.stdout
     assert "Camoufox stderr 日志" in result.stderr
+
+
+def test_start_camoufox_ps1_interrupt_cleanup_selftest_notifies_python_before_kill():
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(START_SCRIPT),
+            "-SkipDependencyInstall",
+            "-InterruptCleanupSelfTest",
+        ],
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        timeout=30,
+    )
+
+    assert_success(result)
+    assert "等待 Python 停止新任务并关闭当前 Camoufox 浏览器" in result.stdout
+    assert "Python 已完成中断清理" in result.stdout

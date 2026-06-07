@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .base import EmailCreationError, EmailParseError, EmailProvider, EmailTimeoutError
+from .retry import RATE_LIMIT_MAX_RETRIES, delay_to_milliseconds, sleep_rate_limit_retry
 from .utils import extract_activation_link, message_matches_keywords, normalize_text
 
 
@@ -63,11 +64,27 @@ class MailporaryProvider(EmailProvider):
 
     def _refresh_token(self) -> None:
         self.log_debug("正在获取 Mailporary token")
-        try:
-            response = self.client.get(self.HOME_URL)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise EmailCreationError(f"Mailporary 首页请求失败: {exc}") from exc
+        rate_retries = 0
+        while True:
+            try:
+                response = self.client.get(self.HOME_URL)
+            except httpx.HTTPError as exc:
+                raise EmailCreationError(f"Mailporary 首页请求失败: {exc}") from exc
+
+            if response.status_code == 429 and rate_retries < RATE_LIMIT_MAX_RETRIES:
+                rate_retries += 1
+                delay = sleep_rate_limit_retry()
+                self.log_debug(
+                    f"Mailporary 首页限流 429，随机 {delay_to_milliseconds(delay)}ms 后重试 "
+                    f"({rate_retries}/{RATE_LIMIT_MAX_RETRIES})"
+                )
+                continue
+
+            try:
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise EmailCreationError(f"Mailporary 首页请求失败: {exc}") from exc
+            break
         self.token = self._extract_token_from_html(response.text)
 
     def _headers(self) -> dict[str, str]:
@@ -75,33 +92,49 @@ class MailporaryProvider(EmailProvider):
             self._refresh_token()
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _api_get(self, path: str, *, retry_auth: bool = True) -> httpx.Response:
+    def _api_get(
+        self,
+        path: str,
+        *,
+        retry_auth: bool = True,
+        max_429_retries: int = RATE_LIMIT_MAX_RETRIES,
+    ) -> httpx.Response:
         url = f"{self.API_BASE_URL}{path}"
-        try:
-            response = self.client.get(url, headers=self._headers())
-        except httpx.TimeoutException as exc:
-            raise EmailCreationError(f"Mailporary 网络超时: {exc}") from exc
-        except httpx.HTTPError as exc:
-            raise EmailCreationError(f"Mailporary 网络错误: {exc}") from exc
+        rate_retries = 0
+        unavailable_retried = False
+        auth_retried = False
+        while True:
+            try:
+                response = self.client.get(url, headers=self._headers())
+            except httpx.TimeoutException as exc:
+                raise EmailCreationError(f"Mailporary 网络超时: {exc}") from exc
+            except httpx.HTTPError as exc:
+                raise EmailCreationError(f"Mailporary 网络错误: {exc}") from exc
 
-        if response.status_code == 401 and retry_auth:
-            self.log_debug("Mailporary token 失效，刷新 token 后重试")
-            self._refresh_token()
-            return self._api_get(path, retry_auth=False)
-        if response.status_code == 429:
-            self.log_debug("Mailporary 限流 429，60s 后重试")
-            time.sleep(60)
-            return self._api_get(path, retry_auth=False)
-        if response.status_code == 503:
-            self.log_debug("Mailporary 服务不可用 503，5s 后重试")
-            time.sleep(5)
-            return self._api_get(path, retry_auth=False)
+            if response.status_code == 401 and retry_auth and not auth_retried:
+                auth_retried = True
+                self.log_debug("Mailporary token 失效，刷新 token 后重试")
+                self._refresh_token()
+                continue
+            if response.status_code == 429 and rate_retries < max_429_retries:
+                rate_retries += 1
+                delay = sleep_rate_limit_retry()
+                self.log_debug(
+                    f"Mailporary 限流 429，随机 {delay_to_milliseconds(delay)}ms 后重试 "
+                    f"({rate_retries}/{max_429_retries})"
+                )
+                continue
+            if response.status_code == 503 and not unavailable_retried:
+                unavailable_retried = True
+                self.log_debug("Mailporary 服务不可用 503，5s 后重试")
+                time.sleep(5)
+                continue
 
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise EmailCreationError(f"Mailporary API 错误 {response.status_code}: {response.text[:200]}") from exc
-        return response
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise EmailCreationError(f"Mailporary API 错误 {response.status_code}: {response.text[:200]}") from exc
+            return response
 
     def create_inbox(self) -> str:
         try:

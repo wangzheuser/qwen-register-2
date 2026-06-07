@@ -15,6 +15,7 @@ images/qwen_form_error.png
 images/aliyun_probe/
 images/probe_live/
 images/probe_os/
+images/probe_root_loaded.png
 images/debug_*.png
 images/captcha_ai_*.png
 images/*manual_trace*.json
@@ -24,3 +25,5 @@ test/downloaded_files/
 test/*.log
 .start-captcha-config.json
 proxy.txt
+.slider-captcha.lock
+.tmp_captcha_js/

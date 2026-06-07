@@ -1152,7 +1152,7 @@ def _wait_for_captcha_ready(page: Any, *, stop_event: Optional[Any] = None, time
                   const puzzle = document.getElementById('aliyunCaptcha-puzzle');
                   const slider = document.getElementById('aliyunCaptcha-sliding-slider');
                   if (!img && !puzzle && !slider) return {ready: true, aliyun: false, reason: '非 Aliyun 验证码'};
-                  const imageLoaded = el => {
+                  const imageReady = el => {
                     if (!el) return false;
                     const src = String(el.currentSrc || el.src || '');
                     if (!src) return false;
@@ -1169,7 +1169,7 @@ def _wait_for_captcha_ready(page: Any, *, stop_event: Optional[Any] = None, time
                   const sliderBox = visibleBox(slider);
                   const ready = Boolean(
                     img && puzzle && slider &&
-                    imageLoaded(img) && imageLoaded(puzzle) &&
+                    imageReady(img) && imageReady(puzzle) &&
                     imgBox && imgBox.width > 100 && imgBox.height > 80 &&
                     puzzleBox && puzzleBox.width > 10 && puzzleBox.height > 50 &&
                     sliderBox && sliderBox.width > 10 && sliderBox.height > 10

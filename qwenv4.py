@@ -28,6 +28,7 @@ try:  # pragma: no cover - 依赖缺失时保留线程级兜底锁。
 except ImportError:  # pragma: no cover
     portalocker = None  # type: ignore
 
+from captcha_solvers.slider_lock import SliderLockTimeout, acquire_slider_lock
 from captcha_solvers.ai_slider import (
     DEFAULT_CAPTCHA_AI_ATTEMPTS,
     DEFAULT_CAPTCHA_AI_BASE_URL,
@@ -79,6 +80,9 @@ _ACCOUNT_SAVE_LOCKS = {}
 _ACCOUNT_SAVE_LOCKS_GUARD = threading.Lock()
 STOP_EVENT = threading.Event()
 INTERRUPT_COUNT = 0
+WORKER_START_INTERVAL_SECONDS = 0.1
+START_STOP_FILE_ENV = "QWEN_REGISTER_STOP_FILE"
+START_MANAGED_ENV = "QWEN_REGISTER_MANAGED_BY_START"
 
 
 class _FallbackAccountLock:
@@ -337,18 +341,39 @@ def _force_exit_after_interrupt(timeout=None):
     os._exit(130)
 
 
-def request_shutdown(reason="收到中断信号"):
+def request_shutdown(reason="收到中断信号", force_exit=True):
     """请求所有账号任务尽快停止。"""
     global INTERRUPT_COUNT
     INTERRUPT_COUNT += 1
     if not STOP_EVENT.is_set():
         print(f"\n🛑 {reason}，正在请求所有任务停止...", flush=True)
-        print("   若浏览器或底层驱动未及时退出，将在数秒后自动强制结束。", flush=True)
-        threading.Thread(target=_force_exit_after_interrupt, daemon=True).start()
+        if force_exit:
+            print("   若浏览器或底层驱动未及时退出，将在数秒后自动强制结束。", flush=True)
+            threading.Thread(target=_force_exit_after_interrupt, daemon=True).start()
+        else:
+            print("   已由启动脚本接管超时兜底，将优先等待当前浏览器清理完成。", flush=True)
     elif INTERRUPT_COUNT >= 2:
         print("\n🛑 再次收到中断，强制结束当前进程。", flush=True)
         os._exit(130)
     STOP_EVENT.set()
+
+
+def start_parent_stop_file_watcher():
+    """监控 start.ps1 写入的停止信号文件，用于干净中断。"""
+    stop_file = os.getenv(START_STOP_FILE_ENV, "").strip()
+    if not stop_file:
+        return None
+
+    def _watch():
+        while not STOP_EVENT.is_set():
+            if os.path.exists(stop_file):
+                request_shutdown("收到启动脚本停止请求", force_exit=False)
+                return
+            time.sleep(0.2)
+
+    watcher = threading.Thread(target=_watch, name="start-stop-file-watcher", daemon=True)
+    watcher.start()
+    return watcher
 
 def sleep_interruptible(seconds):
     """可被 STOP_EVENT 打断的等待；返回 False 表示被停止请求打断。"""
@@ -400,6 +425,33 @@ def collect_account_futures(futures, total_accounts, poll_interval=0.5):
             except Exception as e:
                 print(f"  ❌ [账号 {index}/{total_accounts}] 任务异常: {e}")
     return success_count
+
+
+def submit_account_futures(
+    executor,
+    total_accounts,
+    args,
+    worker,
+    proxy_str=None,
+    start_interval=WORKER_START_INTERVAL_SECONDS,
+):
+    """按账号顺序提交 worker，并在并发启动之间错峰等待。"""
+    futures = {}
+    for index in range(1, total_accounts + 1):
+        if STOP_EVENT.is_set():
+            break
+        future = executor.submit(
+            worker,
+            index,
+            total_accounts,
+            args,
+            proxy_str,
+        )
+        futures[future] = index
+        if index < total_accounts and start_interval > 0:
+            if not sleep_interruptible(start_interval):
+                break
+    return futures
 
 
 def maybe_sync_account_to_qwen2api(email, password, token, config, label=""):
@@ -927,84 +979,97 @@ def register_qwen(
         if detect_captcha(page):
             print("  🤖 检测到验证码弹窗")
             label_prefix = f"{label} " if label else ""
-            manual_trace_records = None
-            if captcha_solver_config is not None and captcha_solver_config.enabled:
-                solver_result = solve_slider_captcha(
-                    page,
-                    captcha_solver_config,
-                    label=label,
-                    image_dir=IMAGES_DIR,
-                    stop_event=STOP_EVENT,
-                )
-                if solver_result.ok:
-                    print(f"  ✅ {label_prefix}{solver_result.message}")
-                    time.sleep(3)
-                elif captcha_solver_config.fallback_manual:
-                    print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
-                    manual_trace_records = attach_manual_trace_recorder(
-                        page,
-                        label=label,
-                        image_dir=IMAGES_DIR,
-                    )
-                    captcha_completed = wait_for_captcha_completion(
-                        page,
-                        email,
-                        password,
-                        name,
-                        timeout=captcha_timeout,
-                    )
-                    if not captcha_completed:
-                        dump_manual_trace_recording(
-                            page,
-                            manual_trace_records,
-                            label=label,
-                            image_dir=IMAGES_DIR,
-                        )
-                        print("  ❌ 验证码未完成或超时")
-                        return False
-                    dump_manual_trace_recording(
-                        page,
-                        manual_trace_records,
-                        label=label,
-                        image_dir=IMAGES_DIR,
-                    )
-                    time.sleep(3)
-                else:
-                    print(f"  ❌ {label_prefix}{solver_result.message}")
-                    return False
-            else:
-                manual_trace_records = attach_manual_trace_recorder(
-                    page,
-                    label=label,
-                    image_dir=IMAGES_DIR,
-                )
-                # 等待用户手动完成验证码
-                captcha_completed = wait_for_captcha_completion(
-                    page,
-                    email,
-                    password,
-                    name,
-                    timeout=captcha_timeout,
-                )
+            try:
+                with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
 
-                if not captcha_completed:
-                    dump_manual_trace_recording(
-                        page,
-                        manual_trace_records,
-                        label=label,
-                        image_dir=IMAGES_DIR,
-                    )
-                    print("  ❌ 验证码未完成或超时")
-                    return False
+                    if not detect_captcha(page):
+                        print(f"  ✅ {label_prefix}验证码已在等待期间完成")
+                    else:
+                        manual_trace_records = None
+                        if captcha_solver_config is not None and captcha_solver_config.enabled:
+                            solver_result = solve_slider_captcha(
+                                page,
+                                captcha_solver_config,
+                                label=label,
+                                image_dir=IMAGES_DIR,
+                                stop_event=STOP_EVENT,
+                            )
+                            if solver_result.ok:
+                                print(f"  ✅ {label_prefix}{solver_result.message}")
+                                time.sleep(3)
+                            elif captcha_solver_config.fallback_manual:
+                                print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
+                                manual_trace_records = attach_manual_trace_recorder(
+                                    page,
+                                    label=label,
+                                    image_dir=IMAGES_DIR,
+                                )
+                                captcha_completed = wait_for_captcha_completion(
+                                    page,
+                                    email,
+                                    password,
+                                    name,
+                                    timeout=captcha_timeout,
+                                )
+                                if not captcha_completed:
+                                    dump_manual_trace_recording(
+                                        page,
+                                        manual_trace_records,
+                                        label=label,
+                                        image_dir=IMAGES_DIR,
+                                    )
+                                    print("  ❌ 验证码未完成或超时")
+                                    return False
+                                dump_manual_trace_recording(
+                                    page,
+                                    manual_trace_records,
+                                    label=label,
+                                    image_dir=IMAGES_DIR,
+                                )
+                                time.sleep(3)
+                            else:
+                                print(f"  ❌ {label_prefix}{solver_result.message}")
+                                return False
+                        else:
+                            manual_trace_records = attach_manual_trace_recorder(
+                                page,
+                                label=label,
+                                image_dir=IMAGES_DIR,
+                            )
+                            # 等待用户手动完成验证码
+                            captcha_completed = wait_for_captcha_completion(
+                                page,
+                                email,
+                                password,
+                                name,
+                                timeout=captcha_timeout,
+                            )
 
-                # 验证码完成后，等待页面跳转
-                dump_manual_trace_recording(
-                    page,
-                    manual_trace_records,
-                    label=label,
-                    image_dir=IMAGES_DIR,
-                )
-                time.sleep(3)
+                            if not captcha_completed:
+                                dump_manual_trace_recording(
+                                    page,
+                                    manual_trace_records,
+                                    label=label,
+                                    image_dir=IMAGES_DIR,
+                                )
+                                print("  ❌ 验证码未完成或超时")
+                                return False
+
+                            # 验证码完成后，等待页面跳转
+                            dump_manual_trace_recording(
+                                page,
+                                manual_trace_records,
+                                label=label,
+                                image_dir=IMAGES_DIR,
+                            )
+                            time.sleep(3)
+            except SliderLockTimeout as e:
+                print(f"  🛑 {label_prefix}{e}")
+                return False
 
         # 检查注册结果
         body = page.evaluate('document.body.innerText') or ''
@@ -1230,11 +1295,13 @@ def main():
         previous_sigint = signal.getsignal(signal.SIGINT)
 
         def _handle_sigint(_signum, _frame):
-            request_shutdown("收到 Ctrl+C")
+            managed_by_start = os.getenv(START_MANAGED_ENV, "") == "1"
+            request_shutdown("收到 Ctrl+C", force_exit=not managed_by_start)
 
         signal.signal(signal.SIGINT, _handle_sigint)
     except Exception:
         previous_sigint = None
+    start_parent_stop_file_watcher()
 
     args = parse_args()
     num_accounts = args.count
@@ -1283,16 +1350,13 @@ def main():
     success_count = 0
     try:
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            futures = {
-                executor.submit(
-                    run_single_account,
-                    index,
-                    num_accounts,
-                    args,
-                    None,
-                ): index
-                for index in range(1, num_accounts + 1)
-            }
+            futures = submit_account_futures(
+                executor,
+                total_accounts=num_accounts,
+                args=args,
+                worker=run_single_account,
+                proxy_str=None,
+            )
             try:
                 success_count = collect_account_futures(futures, num_accounts)
             finally:

@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .base import EmailCreationError, EmailParseError, EmailProvider, EmailTimeoutError
+from .retry import RATE_LIMIT_MAX_RETRIES, delay_to_milliseconds, sleep_rate_limit_retry
 from .utils import extract_activation_link, message_matches_keywords, normalize_text
 
 
@@ -51,7 +52,7 @@ class MailtmProvider(EmailProvider):
         method: str,
         path: str,
         *,
-        max_429_retries: int = 3,
+        max_429_retries: int = RATE_LIMIT_MAX_RETRIES,
         max_503_retries: int = 2,
         retry_auth: bool = True,
         **kwargs: Any,
@@ -69,8 +70,11 @@ class MailtmProvider(EmailProvider):
 
             if response.status_code == 429 and rate_retries < max_429_retries:
                 rate_retries += 1
-                self.log_debug(f"Mail.tm 限流 429，60s 后重试 ({rate_retries}/{max_429_retries})")
-                time.sleep(60)
+                delay = sleep_rate_limit_retry()
+                self.log_debug(
+                    f"Mail.tm 限流 429，随机 {delay_to_milliseconds(delay)}ms 后重试 "
+                    f"({rate_retries}/{max_429_retries})"
+                )
                 continue
             if response.status_code == 503 and unavailable_retries < max_503_retries:
                 unavailable_retries += 1

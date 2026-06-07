@@ -273,6 +273,85 @@ def test_save_account_concurrent_writes_keep_json_valid(tmp_path, monkeypatch):
 
 
 
+def test_start_parent_stop_file_watcher_requests_shutdown_without_force_exit(tmp_path, monkeypatch):
+    stop_file = tmp_path / "stop.signal"
+    calls = []
+    monkeypatch.setenv(qwenv4.START_STOP_FILE_ENV, str(stop_file))
+    monkeypatch.setattr(qwenv4.time, "sleep", lambda seconds: None)
+
+    def fake_request_shutdown(reason, force_exit=True):
+        calls.append((reason, force_exit))
+        qwenv4.STOP_EVENT.set()
+
+    monkeypatch.setattr(qwenv4, "request_shutdown", fake_request_shutdown)
+    qwenv4.STOP_EVENT.clear()
+    try:
+        stop_file.write_text("stop", encoding="utf-8")
+        watcher = qwenv4.start_parent_stop_file_watcher()
+        watcher.join(timeout=2)
+    finally:
+        qwenv4.STOP_EVENT.clear()
+
+    assert calls == [("收到启动脚本停止请求", False)]
+
+
+def test_submit_account_futures_staggers_worker_start_by_100ms(monkeypatch):
+    sleep_calls = []
+    submitted = []
+
+    class Executor:
+        def submit(self, func, *args):
+            submitted.append((func, args))
+            return f"future-{len(submitted)}"
+
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", lambda seconds: sleep_calls.append(seconds) or True)
+    qwenv4.STOP_EVENT.clear()
+
+    futures = qwenv4.submit_account_futures(
+        Executor(),
+        total_accounts=4,
+        args=object(),
+        worker=lambda *args: True,
+        start_interval=0.1,
+    )
+
+    assert list(futures.values()) == [1, 2, 3, 4]
+    assert [args[0] for _func, args in submitted] == [1, 2, 3, 4]
+    assert sleep_calls == [0.1, 0.1, 0.1]
+
+
+def test_submit_account_futures_stops_staggering_when_shutdown_requested(monkeypatch):
+    sleep_calls = []
+    submitted = []
+
+    class Executor:
+        def submit(self, func, *args):
+            submitted.append((func, args))
+            return f"future-{len(submitted)}"
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        qwenv4.STOP_EVENT.set()
+        return False
+
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", fake_sleep)
+    qwenv4.STOP_EVENT.clear()
+    try:
+        futures = qwenv4.submit_account_futures(
+            Executor(),
+            total_accounts=4,
+            args=object(),
+            worker=lambda *args: True,
+            start_interval=0.1,
+        )
+    finally:
+        qwenv4.STOP_EVENT.clear()
+
+    assert list(futures.values()) == [1]
+    assert len(submitted) == 1
+    assert sleep_calls == [0.1]
+
+
 def test_wait_for_captcha_completion_returns_quickly_when_stop_set(monkeypatch):
     class Page:
         def __init__(self):

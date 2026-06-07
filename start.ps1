@@ -1,6 +1,7 @@
 param(
     [switch]$DryRun,
     [switch]$SkipDependencyInstall,
+    [switch]$InterruptCleanupSelfTest,
     [string]$ConfigPath = ""
 )
 
@@ -25,6 +26,7 @@ $RequirementsPath = Join-Path $ProjectRoot "requirements.txt"
 $ScriptPath = Join-Path $ProjectRoot "qwenv4.py"
 $VenvPath = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
+$PythonInterruptGraceSeconds = 15
 
 function Write-Info([string]$Message) {
     Write-Host "[start] $Message"
@@ -285,6 +287,43 @@ function Stop-ProcessTree([int]$ProcessId) {
     }
 }
 
+function Wait-PythonGracefulShutdown($Process, [int]$GraceSeconds) {
+    if ($null -eq $Process -or $Process.HasExited) {
+        return $true
+    }
+
+    Write-Host ""
+    Write-Info "收到 Ctrl+C，已通知 Python 停止；等待 Python 停止新任务并关闭当前 Playwright 浏览器..."
+    $deadline = [DateTime]::UtcNow.AddSeconds($GraceSeconds)
+    while (-not $Process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ($Process.HasExited) {
+        Write-Info "Python 已完成中断清理。"
+        return $true
+    }
+
+    Write-Info "Python 未在 ${GraceSeconds}s 内退出，强制终止 Python 子进程及其浏览器进程..."
+    Stop-ProcessTree -ProcessId $Process.Id
+    return $false
+}
+
+function Request-PythonGracefulStop([string]$StopFilePath) {
+    if ([string]::IsNullOrWhiteSpace($StopFilePath)) {
+        return
+    }
+    try {
+        $parent = Split-Path -Parent $StopFilePath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        [System.IO.File]::WriteAllText($StopFilePath, "stop", [System.Text.Encoding]::UTF8)
+    } catch {
+        Write-Info "写入 Python 停止信号失败: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
     $invocation = Resolve-PythonInvocation $PythonExe
     $allArguments = @($invocation.Args) + @($Arguments)
@@ -292,19 +331,13 @@ function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
     $handler = $null
     $script:InvokePythonExitCode = 130
     $script:CancelRequested = $false
+    $stopFilePath = Join-Path ([System.IO.Path]::GetTempPath()) ("qwen-register-stop-{0}.signal" -f ([guid]::NewGuid().ToString("N")))
     try {
         $handler = [ConsoleCancelEventHandler]{
             param($sender, $eventArgs)
             $eventArgs.Cancel = $true
             $script:CancelRequested = $true
-            try {
-                if ($script:CurrentPythonProcessId) {
-                    Write-Host ""
-                    Write-Info "收到 Ctrl+C，正在终止 Python 子进程及其浏览器进程..."
-                    Stop-ProcessTree -ProcessId ([int]$script:CurrentPythonProcessId)
-                }
-            } catch {
-            }
+            Request-PythonGracefulStop $stopFilePath
         }
         [Console]::add_CancelKeyPress($handler)
 
@@ -316,14 +349,19 @@ function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
         $startInfo.RedirectStandardOutput = $false
         $startInfo.RedirectStandardError = $false
         $startInfo.EnvironmentVariables["PYTHONUNBUFFERED"] = "1"
+        $startInfo.EnvironmentVariables["QWEN_REGISTER_MANAGED_BY_START"] = "1"
+        $startInfo.EnvironmentVariables["QWEN_REGISTER_STOP_FILE"] = $stopFilePath
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
         [void]$process.Start()
         $script:CurrentPythonProcessId = $process.Id
+        $script:CurrentPythonStopFile = $stopFilePath
 
         while (-not $process.HasExited) {
             if ($script:CancelRequested) {
+                Request-PythonGracefulStop $stopFilePath
+                [void](Wait-PythonGracefulShutdown $process $PythonInterruptGraceSeconds)
                 break
             }
             Start-Sleep -Milliseconds 200
@@ -343,9 +381,79 @@ function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
             $script:InvokePythonExitCode = 130
         }
         $script:CurrentPythonProcessId = $null
+        $script:CurrentPythonStopFile = $null
         if ($null -ne $process) {
             $process.Dispose()
         }
+        Remove-Item -LiteralPath $stopFilePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-InterruptCleanupSelfTest {
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("qwen-start-interrupt-selftest-{0}" -f ([guid]::NewGuid().ToString("N")))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    $childPath = Join-Path $tempDir "child.py"
+    $stopFilePath = Join-Path $tempDir "stop.signal"
+    $startedPath = Join-Path $tempDir "started.txt"
+    $gracefulPath = Join-Path $tempDir "graceful.txt"
+    $childCode = @'
+import os
+import time
+from pathlib import Path
+
+stop_file = Path(os.environ["QWEN_REGISTER_STOP_FILE"])
+started = Path(os.environ["QWEN_REGISTER_SELFTEST_STARTED"])
+graceful = Path(os.environ["QWEN_REGISTER_SELFTEST_GRACEFUL"])
+
+started.write_text("ready", encoding="utf-8")
+while not stop_file.exists():
+    time.sleep(0.05)
+time.sleep(0.2)
+graceful.write_text("ok", encoding="utf-8")
+raise SystemExit(130)
+'@
+    Set-Content -LiteralPath $childPath -Value $childCode -Encoding UTF8
+    $launcher = Get-PythonLauncher
+    $allArguments = @($launcher.Args) + @($childPath)
+    $process = $null
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = [string]$launcher.Command
+        $startInfo.Arguments = Join-ProcessArguments $allArguments
+        $startInfo.WorkingDirectory = $tempDir
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $false
+        $startInfo.RedirectStandardError = $false
+        $startInfo.EnvironmentVariables["QWEN_REGISTER_STOP_FILE"] = $stopFilePath
+        $startInfo.EnvironmentVariables["QWEN_REGISTER_SELFTEST_STARTED"] = $startedPath
+        $startInfo.EnvironmentVariables["QWEN_REGISTER_SELFTEST_GRACEFUL"] = $gracefulPath
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not (Test-Path -LiteralPath $startedPath) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not (Test-Path -LiteralPath $startedPath)) {
+            throw "中断清理自检失败：测试 Python 子进程未启动"
+        }
+
+        Request-PythonGracefulStop $stopFilePath
+        [void](Wait-PythonGracefulShutdown $process 5)
+        if (-not (Test-Path -LiteralPath $gracefulPath)) {
+            throw "中断清理自检失败：Python 未收到停止信号"
+        }
+        return 0
+    } finally {
+        if ($null -ne $process -and -not $process.HasExited) {
+            Stop-ProcessTree -ProcessId $process.Id
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -415,6 +523,15 @@ with sync_playwright() as p:
 
 function Format-CommandForDisplay([string[]]$Arguments) {
     return ($Arguments -join " ")
+}
+
+if ($InterruptCleanupSelfTest) {
+    try {
+        exit (Invoke-InterruptCleanupSelfTest)
+    } catch {
+        Write-Error $_.Exception.Message
+        exit 1
+    }
 }
 
 try {
@@ -512,6 +629,9 @@ try {
     exit $script:InvokePythonExitCode
 } catch [System.Management.Automation.PipelineStoppedException] {
     if ($script:CurrentPythonProcessId) {
+        if ($script:CurrentPythonStopFile) {
+            Request-PythonGracefulStop ([string]$script:CurrentPythonStopFile)
+        }
         Write-Info "正在终止 Python 子进程及其浏览器进程..."
         Stop-ProcessTree -ProcessId ([int]$script:CurrentPythonProcessId)
     }

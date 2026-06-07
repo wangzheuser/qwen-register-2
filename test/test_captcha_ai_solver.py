@@ -2013,8 +2013,8 @@ def test_wait_for_aliyun_captcha_ready_script_allows_http_image_sources(monkeypa
             raise RuntimeError("stop")
 
     assert ai_slider._wait_for_captcha_ready(Page(), stop_event=None, timeout=0.5) is True
-    assert "imageLoaded(img)" in captured["script"]
-    assert "imageLoaded(puzzle)" in captured["script"]
+    assert "imageReady(img)" in captured["script"]
+    assert "imageReady(puzzle)" in captured["script"]
     assert "naturalWidth" in captured["script"]
     assert "complete" in captured["script"]
 
@@ -2053,3 +2053,93 @@ def test_parse_args_ai_defaults_to_os_fast_quadratic(monkeypatch):
 
     assert os.environ["CAPTCHA_DRAG_BACKEND"] == "os"
     assert os.environ["CAPTCHA_DRAG_STRATEGY"] == "fast_quadratic"
+
+
+
+def test_register_qwen_serializes_ai_solver_with_slider_lock(monkeypatch):
+    import threading
+
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+    front_calls = []
+
+    class DummyLocator:
+        def scroll_into_view_if_needed(self):
+            pass
+
+        def click(self):
+            pass
+
+    class DummyNavigation:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class DummyPage:
+        def __init__(self, name):
+            self.name = name
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def wait_for_selector(self, *args, **kwargs):
+            pass
+
+        def fill(self, *args, **kwargs):
+            pass
+
+        def check(self, *args, **kwargs):
+            pass
+
+        def locator(self, *args, **kwargs):
+            return DummyLocator()
+
+        def expect_navigation(self, *args, **kwargs):
+            return DummyNavigation()
+
+        def bring_to_front(self):
+            front_calls.append(self.name)
+
+        def evaluate(self, *args, **kwargs):
+            return "待激活"
+
+    def fake_solver(page, *args, **kwargs):
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        threading.Event().wait(0.05)
+        with active_lock:
+            active -= 1
+        return CaptchaSolverResult(ok=True, message="ok")
+
+    monkeypatch.setattr(qwenv4.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", fake_solver)
+
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda page_name=name: results.append(
+                qwenv4.register_qwen(
+                    DummyPage(page_name),
+                    f"User {page_name}",
+                    f"{page_name}@example.com",
+                    "Password1!",
+                    captcha_solver_config=CaptchaSolverConfig(enabled=True, fallback_manual=False),
+                )
+            )
+        )
+        for name in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert results == [True, True]
+    assert max_active == 1
+    assert sorted(front_calls) == ["a", "b"]

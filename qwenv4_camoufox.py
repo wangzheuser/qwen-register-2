@@ -23,6 +23,7 @@ from qwenv4 import (
     OUTPUT_FILE_JSON,
     OUTPUT_FILE_TXT,
     STOP_EVENT,
+    START_MANAGED_ENV,
     build_browser_proxy,
     request_shutdown,
     build_qwen2api_sync_config,
@@ -41,6 +42,8 @@ from qwenv4 import (
     positive_int,
     register_qwen,
     save_account,
+    start_parent_stop_file_watcher,
+    submit_account_futures,
 )
 
 
@@ -227,9 +230,14 @@ def main():
     """主函数 - Camoufox 自动化注册流程。"""
     STOP_EVENT.clear()
     try:
-        signal.signal(signal.SIGINT, lambda _signum, _frame: request_shutdown("收到 Ctrl+C"))
+        def _handle_sigint(_signum, _frame):
+            managed_by_start = os.getenv(START_MANAGED_ENV, "") == "1"
+            request_shutdown("收到 Ctrl+C", force_exit=not managed_by_start)
+
+        signal.signal(signal.SIGINT, _handle_sigint)
     except Exception:
         pass
+    start_parent_stop_file_watcher()
 
     args = parse_args()
     num_accounts = args.count
@@ -275,16 +283,13 @@ def main():
 
     success_count = 0
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = {
-            executor.submit(
-                run_single_account,
-                index,
-                num_accounts,
-                args,
-                None,
-            ): index
-            for index in range(1, num_accounts + 1)
-        }
+        futures = submit_account_futures(
+            executor,
+            total_accounts=num_accounts,
+            args=args,
+            worker=run_single_account,
+            proxy_str=None,
+        )
         try:
             success_count = collect_account_futures(futures, num_accounts)
         finally:
