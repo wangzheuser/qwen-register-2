@@ -1677,7 +1677,7 @@ def test_install_drag_event_debug_records_motion_state_snapshot():
     assert "getComputedStyle" in page.script
 
 
-def test_dump_drag_event_debug_writes_event_summary(tmp_path):
+def test_dump_drag_event_debug_writes_event_summary(tmp_path, monkeypatch):
     from captcha_solvers.ai_slider import _dump_drag_event_debug
 
     class Page:
@@ -1687,6 +1687,8 @@ def test_dump_drag_event_debug_writes_event_summary(tmp_path):
                 {"kind": "mousemove", "t": 40, "x": 80, "y": 31, "isTrusted": True, "buttons": 1},
                 {"kind": "mouseup", "t": 210, "x": 220, "y": 30, "isTrusted": True, "buttons": 0},
             ]
+
+    monkeypatch.setenv("CAPTCHA_DEBUG_DRAG_ARTIFACTS", "1")
 
     path = _dump_drag_event_debug(Page(), image_dir=str(tmp_path), label="[测试]")
 
@@ -2447,6 +2449,44 @@ def test_alignment_accepts_small_right_bias_to_avoid_over_correction(monkeypatch
     assert _alignment_delta_is_acceptable(-3.1) is False
 
 
+def test_drag_debug_artifacts_disabled_by_default(tmp_path, monkeypatch):
+    from captcha_solvers import ai_slider
+
+    class Root:
+        def screenshot(self, path):
+            Path(path).write_bytes(b"debug")
+
+    class Page:
+        def evaluate(self, _script):
+            return [{"type": "mousemove"}]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CAPTCHA_DEBUG_DRAG_ARTIFACTS", raising=False)
+
+    assert ai_slider._capture_hold_screenshot(Page(), label="测试") is None
+    assert ai_slider._dump_drag_event_debug(Page(), label="测试") is None
+    assert not (tmp_path / "images" / "aliyun_probe").exists()
+
+
+def test_drag_debug_artifacts_can_be_enabled(tmp_path, monkeypatch):
+    from captcha_solvers import ai_slider
+
+    class Page:
+        def evaluate(self, script):
+            if "closest" in script:
+                return True
+            return [{"type": "mousemove"}]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CAPTCHA_DEBUG_DRAG_ARTIFACTS", "1")
+    monkeypatch.setattr(ai_slider, "_find_captcha_root", lambda _page: object())
+    monkeypatch.setattr(ai_slider, "_screenshot_locator", lambda _root, path: Path(path).write_bytes(b"debug"))
+
+    assert ai_slider._capture_hold_screenshot(Page(), label="测试")
+    assert ai_slider._dump_drag_event_debug(Page(), label="测试")
+    assert (tmp_path / "images" / "aliyun_probe").exists()
+
+
 def test_release_backoff_moves_left_when_mouseup_would_settle_right(monkeypatch):
     from captcha_solvers import ai_slider
 
@@ -2493,6 +2533,7 @@ def test_capture_hold_screenshot_writes_captcha_region(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ai_slider, "_find_captcha_root", lambda _page: Root())
     monkeypatch.setattr(ai_slider, "_screenshot_locator", lambda _root, path: Path(path).write_bytes(b"png"))
+    monkeypatch.setenv("CAPTCHA_DEBUG_DRAG_ARTIFACTS", "1")
 
     path = ai_slider._capture_hold_screenshot(object(), image_dir=str(tmp_path), label="[测试]")
 
@@ -2632,6 +2673,22 @@ def test_solve_slider_captcha_accepts_delayed_aliyun_verify_success_network(tmp_
 
     assert result.ok is True
     assert "服务端" in result.message
+
+
+def test_default_captcha_success_wait_is_short_for_failed_drags(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.delenv("CAPTCHA_SUCCESS_WAIT_SECONDS", raising=False)
+
+    assert ai_slider._captcha_success_wait_seconds() == 3.5
+
+
+def test_captcha_success_wait_can_still_be_overridden(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.setenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "9")
+
+    assert ai_slider._captcha_success_wait_seconds() == 9.0
 
 
 def test_wait_for_aliyun_captcha_ready_accepts_loaded_http_images(monkeypatch):

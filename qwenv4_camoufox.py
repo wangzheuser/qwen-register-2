@@ -34,7 +34,6 @@ from qwenv4 import (
     collect_account_futures,
     close_run_logging,
     enable_run_logging,
-    extract_tokens,
     gen_first_name,
     gen_name,
     gen_password,
@@ -51,6 +50,7 @@ from qwenv4 import (
     save_account,
     start_parent_stop_file_watcher,
     submit_account_futures,
+    wait_for_token_extraction,
 )
 
 
@@ -116,8 +116,12 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                 try:
                     context = browser.new_context(viewport=CAMOUFOX_VIEWPORT)
 
-                    current_ip, country = get_current_ip()
-                    print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
+                    if getattr(args, "browser_proxy", "") or proxy_str:
+                        current_ip, country = "unknown", "unknown"
+                        print(f"  📡 {label} 已配置浏览器代理，跳过本机 IP 检测")
+                    else:
+                        current_ip, country = get_current_ip()
+                        print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
 
                     provider = EmailProviderFactory.create(
                         provider_type=args.email_provider,
@@ -172,12 +176,11 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
 
                     print(f"  🔄 {label} 正在打开验证链接...")
                     qwen.goto(verify_url, wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(5)
-
-                    qwen.screenshot(path=f"{IMAGES_DIR}/qwen_verified_{account_index}.png")
 
                     print(f"  🔑 {label} 正在提取认证令牌...")
-                    tokens = extract_tokens(qwen)
+                    tokens = wait_for_token_extraction(qwen, timeout=5.0)
+
+                    qwen.screenshot(path=f"{IMAGES_DIR}/qwen_verified_{account_index}.png")
 
                     if tokens["token"]:
                         print(f"  ✅ {label} 已提取认证令牌: {tokens['token'][:80]}...")

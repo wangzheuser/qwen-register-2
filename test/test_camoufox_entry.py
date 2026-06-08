@@ -104,7 +104,7 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
     monkeypatch.setattr(qwenv4_camoufox, "gen_password", lambda: "Password1!")
     monkeypatch.setattr(qwenv4_camoufox, "gen_name", lambda first_name: f"{first_name} User")
     monkeypatch.setattr(qwenv4_camoufox, "register_qwen", lambda *args, **kwargs: True)
-    monkeypatch.setattr(qwenv4_camoufox, "extract_tokens", lambda _page: {
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_token_extraction", lambda _page, timeout=5.0: {
         "token": "token-1",
         "active_token": None,
         "device_id": None,

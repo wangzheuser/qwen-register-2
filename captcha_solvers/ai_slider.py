@@ -467,9 +467,13 @@ def solve_slider_captcha(
             if network_debug:
                 _dump_captcha_network_debug(network_debug, prefix)
                 _dump_captcha_dom_debug(page, prefix)
-            print(f"  ⚠️ {prefix}{last_message}，等待验证码自动复位后重试")
-            _sleep(2.5, stop_event)
-            _wait_for_captcha_ready(page, stop_event=stop_event, timeout=10)
+            print(f"  ⚠️ {prefix}{last_message}，刷新验证码后重试")
+            try:
+                _try_refresh_captcha(root)
+            except Exception:
+                pass
+            _sleep(_captcha_retry_reset_wait_seconds(), stop_event)
+            _wait_for_captcha_ready(page, stop_event=stop_event, timeout=5)
         except Exception as exc:
             last_message = str(exc)
             print(f"  ⚠️ {prefix}AI 滑块处理异常: {last_message}")
@@ -2198,7 +2202,13 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
     return distance
 
 
+def _drag_debug_artifacts_enabled() -> bool:
+    return os.getenv("CAPTCHA_DEBUG_DRAG_ARTIFACTS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _capture_hold_screenshot(page: Any, *, image_dir: str = "images", label: str = "") -> Optional[str]:
+    if not _drag_debug_artifacts_enabled():
+        return None
     try:
         root = _find_captcha_root(page)
         if root is None:
@@ -2298,6 +2308,8 @@ def _drag_event_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _dump_drag_event_debug(page: Any, *, image_dir: str = "images", label: str = "") -> Optional[str]:
+    if not _drag_debug_artifacts_enabled():
+        return None
     try:
         events = page.evaluate("() => window.__captchaDragEvents || []") or []
     except Exception:
@@ -3177,9 +3189,16 @@ def _captcha_solved(page: Any) -> bool:
 
 def _captcha_success_wait_seconds() -> float:
     try:
-        return max(1.0, float(os.getenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "12")))
+        return max(1.0, float(os.getenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "3.5")))
     except Exception:
-        return 12.0
+        return 3.5
+
+
+def _captcha_retry_reset_wait_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("CAPTCHA_RETRY_RESET_WAIT_SECONDS", "0.8")))
+    except Exception:
+        return 0.8
 
 
 def _network_has_aliyun_verify_success(records: Optional[list[dict[str, Any]]]) -> bool:

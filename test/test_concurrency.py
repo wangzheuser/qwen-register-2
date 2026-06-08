@@ -559,6 +559,46 @@ def test_format_average_success_duration_handles_no_success():
     assert qwenv4.format_average_success_duration(summary) == "无成功账号"
 
 
+def test_wait_for_registration_submission_returns_as_soon_as_success(monkeypatch):
+    class Page:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, _script):
+            self.calls += 1
+            if self.calls >= 2:
+                return "verification email 已发送"
+            return "处理中"
+
+    sleeps = []
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", lambda seconds: sleeps.append(seconds) or True)
+
+    assert qwenv4.wait_for_registration_submission(Page(), timeout=3, interval=0.2) is True
+    assert sleeps == [0.2]
+
+
+def test_wait_for_token_extraction_returns_token_without_fixed_sleep(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_extract(_page):
+        calls["count"] += 1
+        return {
+            "token": "token-ok" if calls["count"] == 2 else None,
+            "active_token": None,
+            "device_id": None,
+            "user_role": "user",
+        }
+
+    sleeps = []
+    monkeypatch.setattr(qwenv4, "extract_tokens", fake_extract)
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", lambda seconds: sleeps.append(seconds) or True)
+
+    tokens = qwenv4.wait_for_token_extraction(object(), timeout=3, interval=0.2)
+
+    assert tokens["token"] == "token-ok"
+    assert sleeps == [0.2]
+
+
 
 def test_request_shutdown_forces_exit_after_short_grace(monkeypatch):
     exits = []

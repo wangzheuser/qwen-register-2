@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -16,6 +17,10 @@ from .utils import extract_activation_link, message_matches_keywords, normalize_
 class MailtmProvider(EmailProvider):
     provider_name = "Mail.tm"
     BASE_URL = "https://api.mail.tm"
+    _domains_cache: list[str] = []
+    _domains_cache_time: float = 0.0
+    _domains_cache_ttl_seconds: float = 300.0
+    _domains_cache_lock = threading.Lock()
 
     def __init__(
         self,
@@ -97,6 +102,15 @@ class MailtmProvider(EmailProvider):
             return response
 
     def _active_domains(self) -> list[str]:
+        if self._owns_client:
+            now = time.monotonic()
+            with self._domains_cache_lock:
+                if (
+                    self._domains_cache
+                    and now - self._domains_cache_time < self._domains_cache_ttl_seconds
+                ):
+                    self.log_debug("复用 Mail.tm 可用域名缓存")
+                    return list(self._domains_cache)
         self.log_debug("正在获取 Mail.tm 可用域名")
         response = self._request("GET", "/domains")
         domains = [
@@ -106,6 +120,10 @@ class MailtmProvider(EmailProvider):
         ]
         if not domains:
             raise EmailCreationError("Mail.tm 未返回可用域名")
+        if self._owns_client:
+            with self._domains_cache_lock:
+                self.__class__._domains_cache = list(domains)
+                self.__class__._domains_cache_time = time.monotonic()
         return domains
 
     def _authenticate(self) -> None:

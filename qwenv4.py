@@ -770,7 +770,7 @@ def gen_name(first_name):
 def get_current_ip(client=None):
     """通过 HTTP 请求获取当前公网 IP 和国家，不启动浏览器页面。"""
     owns_client = client is None
-    http_client = client or httpx.Client(timeout=20.0)
+    http_client = client or httpx.Client(timeout=3.0)
     try:
         data = http_client.get('https://api.ipify.org?format=json').json()
         ip = data.get('ip', 'unknown')
@@ -980,6 +980,62 @@ def extract_tokens(page):
             'device_id': None,
             'user_role': None
         }
+
+
+def registration_submission_detected(body_text):
+    """判断注册提交是否已进入等待邮箱验证状态。"""
+    text = body_text or ""
+    lower = text.lower()
+    return (
+        "待激活" in text
+        or "激活账号" in text
+        or "pending activation" in lower
+        or "verification email" in lower
+    )
+
+
+def wait_for_registration_submission(page, timeout=3.0, interval=0.25):
+    """验证码通过后短轮询注册提交状态，避免无条件固定等待。"""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if STOP_EVENT.is_set():
+            return False
+        try:
+            body = page.evaluate("document.body.innerText") or ""
+            if registration_submission_detected(body):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        wait_seconds = min(float(interval), max(0.0, deadline - time.monotonic()))
+        if not sleep_interruptible(wait_seconds):
+            return False
+
+
+def wait_for_token_extraction(page, timeout=5.0, interval=0.25):
+    """打开验证链接后短轮询 token，token 出现即返回。"""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    last_tokens = {
+        "token": None,
+        "active_token": None,
+        "device_id": None,
+        "user_role": "user",
+    }
+    while True:
+        if STOP_EVENT.is_set():
+            return last_tokens
+        try:
+            last_tokens = extract_tokens(page)
+            if last_tokens.get("token"):
+                return last_tokens
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return last_tokens
+        wait_seconds = min(float(interval), max(0.0, deadline - time.monotonic()))
+        if not sleep_interruptible(wait_seconds):
+            return last_tokens
 
 
 # ──────────────────────────────────────────────────────────
@@ -1260,7 +1316,7 @@ def register_qwen(
                             )
                             if solver_result.ok:
                                 print(f"  ✅ {label_prefix}{solver_result.message}")
-                                time.sleep(3)
+                                wait_for_registration_submission(page, timeout=3.0)
                             elif captcha_solver_config.fallback_manual:
                                 print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
                                 manual_trace_records = attach_manual_trace_recorder(
@@ -1290,7 +1346,7 @@ def register_qwen(
                                     label=label,
                                     image_dir=IMAGES_DIR,
                                 )
-                                time.sleep(3)
+                                wait_for_registration_submission(page, timeout=3.0)
                             else:
                                 print(f"  ❌ {label_prefix}{solver_result.message}")
                                 return False
@@ -1326,7 +1382,7 @@ def register_qwen(
                                 label=label,
                                 image_dir=IMAGES_DIR,
                             )
-                            time.sleep(3)
+                            wait_for_registration_submission(page, timeout=3.0)
             except SliderLockTimeout as e:
                 print(f"  🛑 {label_prefix}{e}")
                 return False
@@ -1335,7 +1391,7 @@ def register_qwen(
         body = page.evaluate('document.body.innerText') or ''
 
         # 成功标志
-        if '待激活' in body or '激活账号' in body or 'pending activation' in body.lower() or 'verification email' in body.lower():
+        if registration_submission_detected(body):
             print("  ✅ 注册已提交，等待邮箱验证")
             return True
 
@@ -1450,8 +1506,12 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     viewport={'width': 1280, 'height': 800},
                 )
 
-                current_ip, country = get_current_ip()
-                print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
+                if getattr(args, "browser_proxy", "") or proxy_str:
+                    current_ip, country = "unknown", "unknown"
+                    print(f"  📡 {label} 已配置浏览器代理，跳过本机 IP 检测")
+                else:
+                    current_ip, country = get_current_ip()
+                    print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
 
                 provider = EmailProviderFactory.create(
                     provider_type=args.email_provider,
@@ -1508,12 +1568,11 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
 
                 print(f"  🔄 {label} 正在打开验证链接...")
                 qwen.goto(verify_url, wait_until='domcontentloaded', timeout=30000)
-                time.sleep(5)
-
-                qwen.screenshot(path=f'{IMAGES_DIR}/qwen_verified_{account_index}.png')
 
                 print(f"  🔑 {label} 正在提取认证令牌...")
-                tokens = extract_tokens(qwen)
+                tokens = wait_for_token_extraction(qwen, timeout=5.0)
+
+                qwen.screenshot(path=f'{IMAGES_DIR}/qwen_verified_{account_index}.png')
 
                 if tokens['token']:
                     print(f"  ✅ {label} 已提取认证令牌: {tokens['token'][:80]}...")
