@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from camoufox.sync_api import Camoufox
 
+from captcha_solvers.slider_lock import acquire_foreground_window_lock
 from email_providers import EmailCreationError, EmailProviderError, EmailProviderFactory
 from email_providers.generator_email import GeneratorEmailProvider
 from email_providers.store import UsedEmailsStore
@@ -29,6 +30,8 @@ from qwenv4 import (
     build_qwen2api_sync_config,
     build_captcha_solver_config,
     collect_account_futures,
+    close_run_logging,
+    enable_run_logging,
     extract_tokens,
     gen_first_name,
     gen_name,
@@ -92,7 +95,8 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
             print(f"  🛑 {label} 已收到停止请求，跳过")
             return False
         try:
-            browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
+            with acquire_foreground_window_lock(label=f"{label} Camoufox 启动", stop_event=STOP_EVENT):
+                browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")
@@ -136,7 +140,8 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                     print(f"  👤 {label} 用户名:  {name}")
                     print(f"  🔑 {label} 密码:    {password}")
 
-                    qwen = context.new_page()
+                    with acquire_foreground_window_lock(label=f"{label} 新建注册页", stop_event=STOP_EVENT):
+                        qwen = context.new_page()
                     install_aliyun_callback_probe(qwen)
                     if STOP_EVENT.is_set():
                         print(f"  🛑 {label} 已收到停止请求，跳过注册")
@@ -240,71 +245,82 @@ def main():
     start_parent_stop_file_watcher()
 
     args = parse_args()
-    num_accounts = args.count
-    if num_accounts is None:
-        try:
-            num_accounts = positive_int(input("📊 要创建多少个账号？ "))
-        except Exception:
-            print("❌ 数量无效")
-            sys.exit(1)
+    logging_state = enable_run_logging(args, script_stem="qwenv4-camoufox")
+    try:
+        print(f"🧾 运行日志: {logging_state.path}")
+        num_accounts = args.count
+        if num_accounts is None:
+            try:
+                num_accounts = positive_int(input("📊 要创建多少个账号？ "))
+            except Exception:
+                print("❌ 数量无效")
+                sys.exit(1)
 
-    os.makedirs(IMAGES_DIR, exist_ok=True)
+        os.makedirs(IMAGES_DIR, exist_ok=True)
 
-    print(f"\n🎯 准备使用 Camoufox 创建 {num_accounts} 个 Qwen 账号...")
-    print(f"📮 邮箱服务: {args.email_provider}")
-    if args.api_proxy and not is_generator_provider(args.email_provider):
-        print(f"🔌 API 代理: {args.api_proxy}")
-    if args.browser_proxy:
-        print("🌐 浏览器代理: 已配置（每个账号启动时动态解析）")
-    print(f"🚦 并发数量: {args.concurrency}")
-    minutes = args.captcha_timeout // 60
-    minute_text = f" / {minutes}分钟" if minutes else ""
-    print(f"🤖 滑块等待: {args.captcha_timeout}s{minute_text}")
-    if args.captcha_solver == "ai":
-        fallback_text = "启用" if not args.no_captcha_ai_fallback_manual else "禁用"
-        print(f"🧠 滑块 AI: 已启用（模型 {args.captcha_ai_model}，人工回退{fallback_text}）")
-    else:
-        print("🧠 滑块 AI: 未启用")
-    if args.captcha_record_trace:
-        print("🎥 滑块轨迹录制: 已启用（人工通过后会保存 manual_trace_*.json）")
-    if args.captcha_replay_trace:
-        print(f"🎞️ 滑块轨迹重放: {args.captcha_replay_trace}")
-    print(f"🖱️ 滑块拖动后端: {args.captcha_drag_backend}")
-    print(f"🧭 滑块拖动策略: {args.captcha_drag_strategy}")
-    if args.captcha_callback_bypass:
-        print("🧪 本地靶场回调实验: 已启用")
-    if getattr(args, "captcha_force_verify_success", False):
-        print("🧪 本地靶场 Verify 响应替换: 已启用")
-    if args.sync_qwen2api:
-        print(f"🔁 qwen2API 同步: 已启用（{args.qwen2api_base_url}）")
-    else:
-        print("🔁 qwen2API 同步: 未启用")
-    print("🔒 严格模式: 已启用（不会自动降级）\n")
+        print(f"\n🎯 准备使用 Camoufox 创建 {num_accounts} 个 Qwen 账号...")
+        print(f"📮 邮箱服务: {args.email_provider}")
+        if args.api_proxy and not is_generator_provider(args.email_provider):
+            print(f"🔌 API 代理: {args.api_proxy}")
+        if args.browser_proxy:
+            print("🌐 浏览器代理: 已配置（每个账号启动时动态解析）")
+        print(f"🚦 并发数量: {args.concurrency}")
+        if args.captcha_solver == "ddddocr":
+            print("🧠 滑块处理: ddddocr 本地自动（最多 3 次，失败不回退人工）")
+        elif args.captcha_solver == "ai":
+            minutes = args.captcha_timeout // 60
+            minute_text = f" / {minutes}分钟" if minutes else ""
+            print(f"🤖 滑块 AI 超时: {args.captcha_timeout}s{minute_text}")
+            print(f"🧠 滑块处理: 远程 AI（模型 {args.captcha_ai_model}，失败不回退人工）")
+        else:
+            minutes = args.captcha_timeout // 60
+            minute_text = f" / {minutes}分钟" if minutes else ""
+            print(f"🤖 人工滑块等待: {args.captcha_timeout}s{minute_text}")
+            print("🧠 滑块处理: 人工")
+        if args.captcha_record_trace:
+            print("🎥 滑块轨迹录制: 已启用（人工通过后会保存 manual_trace_*.json）")
+        if args.captcha_replay_trace:
+            print(f"🎞️ 滑块轨迹重放: {args.captcha_replay_trace}")
+        print(f"🖱️ 滑块拖动后端: {args.captcha_drag_backend}")
+        print(f"🧭 滑块拖动策略: {args.captcha_drag_strategy}")
+        if args.captcha_target_right_bias is not None:
+            print(f"🎚️ 滑块释放目标右偏: {float(args.captcha_target_right_bias):+.1f}px")
+        if args.captcha_callback_bypass:
+            print("🧪 本地靶场回调实验: 已启用")
+        if getattr(args, "captcha_force_verify_success", False):
+            print("🧪 本地靶场 Verify 响应替换: 已启用")
+        if args.sync_qwen2api:
+            print(f"🔁 qwen2API 同步: 已启用（{args.qwen2api_base_url}）")
+        else:
+            print("🔁 qwen2API 同步: 未启用")
+        print("🔒 严格模式: 已启用（不会自动降级）\n")
 
-    success_count = 0
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = submit_account_futures(
-            executor,
-            total_accounts=num_accounts,
-            args=args,
-            worker=run_single_account,
-            proxy_str=None,
-        )
-        try:
-            success_count = collect_account_futures(futures, num_accounts)
-        finally:
-            if STOP_EVENT.is_set():
-                for future in futures:
-                    future.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
-                print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
+        success_count = 0
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = submit_account_futures(
+                executor,
+                total_accounts=num_accounts,
+                args=args,
+                worker=run_single_account,
+                proxy_str=None,
+            )
+            try:
+                success_count = collect_account_futures(futures, num_accounts)
+            finally:
+                if STOP_EVENT.is_set():
+                    for future in futures:
+                        future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
 
-    print(f"\n{'═'*60}")
-    print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")
-    print("💾 结果保存到:")
-    print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
-    print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
-    print(f"{'═'*60}")
+        print(f"\n{'═'*60}")
+        print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")
+        print("💾 结果保存到:")
+        print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
+        print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
+        print(f"{'═'*60}")
+    finally:
+        close_run_logging(logging_state)
 
 
 if __name__ == "__main__":

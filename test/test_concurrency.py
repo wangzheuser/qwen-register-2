@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import httpx
@@ -15,6 +16,70 @@ def test_parse_args_accepts_concurrency_and_captcha_timeout():
     assert args.concurrency == 3
     assert args.captcha_timeout == 600
 
+
+
+def test_parse_args_accepts_log_file_path():
+    args = qwenv4.parse_args(["1", "--log-file", "logs/custom.log"])
+
+    assert args.log_file == "logs/custom.log"
+
+
+def test_enable_run_logging_writes_stdout_and_stderr_to_file(tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    log_path = tmp_path / "run.log"
+    state = qwenv4.enable_run_logging(SimpleNamespace(log_file=str(log_path)), script_stem="test-run")
+    try:
+        print("stdout 明文 token-123")
+        print("stderr 明文 password-456", file=sys.stderr)
+    finally:
+        qwenv4.close_run_logging(state)
+
+    content = log_path.read_text(encoding="utf-8")
+    assert "stdout 明文 token-123" in content
+    assert "stderr 明文 password-456" in content
+    assert "[MainThread:" in content
+
+
+def test_enable_run_logging_uses_single_default_file():
+    from types import SimpleNamespace
+
+    state = qwenv4.enable_run_logging(SimpleNamespace(log_file=""), script_stem="test-single")
+    try:
+        assert state.path == Path("logs") / "test-single.log"
+    finally:
+        qwenv4.close_run_logging(state)
+
+
+def test_trim_log_file_discards_oldest_content_when_over_limit(tmp_path):
+    log_path = tmp_path / "single.log"
+    log_path.write_text("old-line\n" + "x" * 40 + "\nnew-line\n", encoding="utf-8")
+
+    qwenv4.trim_log_file_to_limit(log_path, max_bytes=32)
+
+    content = log_path.read_text(encoding="utf-8")
+    assert len(log_path.read_bytes()) <= 32
+    assert "old-line" not in content
+    assert "new-line" in content
+
+
+def test_run_logging_auto_trims_single_file_while_writing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    log_path = tmp_path / "run.log"
+    monkeypatch.setattr(qwenv4, "RUN_LOG_MAX_BYTES", 96)
+    state = qwenv4.enable_run_logging(SimpleNamespace(log_file=str(log_path)), script_stem="ignored")
+    try:
+        print("old-content-" + "x" * 80)
+        print("new-content")
+    finally:
+        qwenv4.close_run_logging(state)
+
+    content = log_path.read_text(encoding="utf-8")
+    assert len(log_path.read_bytes()) <= 96
+    assert "old-content" not in content
+    assert "new-content" in content
 
 
 def test_parse_args_accepts_browser_proxy_template():
@@ -215,6 +280,23 @@ def test_register_qwen_passes_captcha_timeout(monkeypatch):
     assert seen["timeout"] == 600
 
 
+def test_run_single_account_retries_failed_attempt(monkeypatch):
+    import types
+    import qwenv4
+
+    calls = []
+
+    def fake_once(account_index, total_accounts, args, proxy_str=None):
+        calls.append((account_index, total_accounts, proxy_str))
+        return len(calls) == 2
+
+    monkeypatch.setattr(qwenv4, "_run_single_account_once", fake_once)
+    args = types.SimpleNamespace(account_retries=2)
+
+    assert qwenv4.run_single_account(1, 10, args, "proxy") is True
+    assert calls == [(1, 10, "proxy"), (1, 10, "proxy")]
+
+
 def test_used_emails_store_claim_is_atomic_for_same_email(tmp_path):
     path = tmp_path / "used_emails.json"
     barrier = threading.Barrier(20)
@@ -271,6 +353,20 @@ def test_save_account_concurrent_writes_keep_json_valid(tmp_path, monkeypatch):
     assert {item["email"] for item in data} == {f"user{i}@example.com" for i in range(20)}
     assert len(txt_path.read_text(encoding="utf-8").strip().splitlines()) == 20
 
+
+
+def test_workers_guard_foreground_sensitive_launch_and_new_page():
+    import inspect
+    import qwenv4_camoufox
+
+    normal_source = inspect.getsource(qwenv4._run_single_account_once)
+    camoufox_source = inspect.getsource(qwenv4_camoufox.run_single_account)
+
+    assert "acquire_foreground_window_lock(label=f\"{label} 浏览器启动\"" in normal_source
+    assert "acquire_foreground_window_lock(label=f\"{label} 新建注册页\"" in normal_source
+    assert "acquire_foreground_window_lock(label=f\"{label} Camoufox 启动\"" in camoufox_source
+    assert "acquire_foreground_window_lock(label=f\"{label} 新建注册页\"" in camoufox_source
+    assert "with acquire_slider_lock(label=label" in inspect.getsource(qwenv4.register_qwen)
 
 
 def test_start_parent_stop_file_watcher_requests_shutdown_without_force_exit(tmp_path, monkeypatch):

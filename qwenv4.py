@@ -18,6 +18,7 @@ import threading
 import signal
 import urllib.parse
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 import httpx
@@ -28,7 +29,8 @@ try:  # pragma: no cover - 依赖缺失时保留线程级兜底锁。
 except ImportError:  # pragma: no cover
     portalocker = None  # type: ignore
 
-from captcha_solvers.slider_lock import SliderLockTimeout, acquire_slider_lock
+from captcha_solvers.slider_lock import SliderLockTimeout, acquire_foreground_window_lock, acquire_slider_lock
+from captcha_solvers.window_focus import ensure_page_foreground
 from captcha_solvers.ai_slider import (
     DEFAULT_CAPTCHA_AI_ATTEMPTS,
     DEFAULT_CAPTCHA_AI_BASE_URL,
@@ -63,6 +65,7 @@ OUTPUT_FILE_TXT = "qwen_accounts.txt"
 OUTPUT_FILE_JSON = "qwen_accounts.json"
 IMAGES_DIR = "images"
 HEADLESS = False  # 必须为 False 以支持手动完成验证码
+RUN_LOG_MAX_BYTES = 128 * 1024 * 1024
 
 BROWSER_ARGS = [
     '--disable-blink-features=AutomationControlled',
@@ -160,6 +163,12 @@ def parse_args(argv=None):
         help="并发账号数量，范围 1-10，默认: 1",
     )
     parser.add_argument(
+        "--account-retries",
+        type=positive_int,
+        default=1,
+        help="单个账号编号失败后的补偿重试次数，默认: 1（不额外重试）",
+    )
+    parser.add_argument(
         "--captcha-timeout",
         type=positive_int,
         default=600,
@@ -167,9 +176,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--captcha-solver",
-        choices=["manual", "ai"],
-        default="manual",
-        help="滑块验证码处理方式：manual=人工等待，ai=优先用 ddddocr 本地匹配，必要时调用 AI；默认: manual",
+        choices=["ddddocr", "manual", "ai"],
+        default="ddddocr",
+        help="滑块验证码处理方式：ddddocr=本地自动识别，ai=远程滑块 AI，manual=人工等待；默认: ddddocr",
     )
     parser.add_argument(
         "--captcha-ai-base-url",
@@ -231,6 +240,12 @@ def parse_args(argv=None):
         help="滑块拖动策略；AI 模式默认: fast_quadratic",
     )
     parser.add_argument(
+        "--captcha-target-right-bias",
+        type=float,
+        default=None,
+        help="滑块目标位置右侧微调像素；默认不额外微调，启动脚本可按当前成功配置传入",
+    )
+    parser.add_argument(
         "--captcha-callback-bypass",
         action="store_true",
         help="本地靶场实验：尝试直接触发 AliyunCaptcha 成功回调（默认关闭）",
@@ -273,10 +288,118 @@ def parse_args(argv=None):
         default=True,
         help="严格模式：失败时跳过当前账号，不自动降级（默认启用，兼容参数）",
     )
+    parser.add_argument(
+        "--log-file",
+        default="",
+        help="运行日志文件路径；默认写入单个 logs/qwenv4.log，并在超过 128MB 时自动丢弃最旧内容",
+    )
     args = parser.parse_args(argv)
     if args.captcha_drag_backend is None:
-        args.captcha_drag_backend = os.getenv("CAPTCHA_DRAG_BACKEND") or ("os" if args.captcha_solver == "ai" else "playwright")
+        args.captcha_drag_backend = os.getenv("CAPTCHA_DRAG_BACKEND") or ("os" if args.captcha_solver in {"ai", "ddddocr"} else "playwright")
     return args
+
+
+class _ThreadAwareTee:
+    """把终端输出同步写入文件，文件内每行带时间和线程信息。"""
+
+    def __init__(self, stream, log_file, stream_name, path, max_bytes):
+        self._stream = stream
+        self._log_file = log_file
+        self._stream_name = stream_name
+        self._path = Path(path)
+        self._max_bytes = max_bytes
+        self._lock = threading.Lock()
+
+    def write(self, data):
+        self._stream.write(data)
+        if not data:
+            return 0
+        text = str(data)
+        with self._lock:
+            for part in text.splitlines(True):
+                if part in {"\n", "\r\n", "\r"}:
+                    self._log_file.write(part)
+                    continue
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                thread = threading.current_thread()
+                self._log_file.write(f"{now} [{thread.name}:{thread.ident}] [{self._stream_name}] {part}")
+            self._log_file.flush()
+            trim_open_log_file_to_limit(self._log_file, self._path, self._max_bytes)
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        with self._lock:
+            self._log_file.flush()
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class RunLoggingState:
+    def __init__(self, path, log_file, stdout, stderr):
+        self.path = path
+        self.log_file = log_file
+        self.stdout = stdout
+        self.stderr = stderr
+        self.closed = False
+
+
+def _default_log_file(script_stem):
+    return Path("logs") / f"{script_stem}.log"
+
+
+def trim_log_file_to_limit(path, max_bytes=RUN_LOG_MAX_BYTES):
+    """把日志文件裁剪到最大字节数，保留末尾最新内容。"""
+    log_path = Path(path)
+    if max_bytes <= 0 or not log_path.exists():
+        return
+    size = log_path.stat().st_size
+    if size <= max_bytes:
+        return
+    with open(log_path, "rb") as handle:
+        handle.seek(max(0, size - max_bytes))
+        data = handle.read(max_bytes)
+    with open(log_path, "wb") as handle:
+        handle.write(data)
+
+
+def trim_open_log_file_to_limit(log_file, path, max_bytes=RUN_LOG_MAX_BYTES):
+    """裁剪当前打开的日志文件并把写入位置移回末尾。"""
+    log_file.flush()
+    trim_log_file_to_limit(path, max_bytes=max_bytes)
+    log_file.seek(0, os.SEEK_END)
+
+
+def enable_run_logging(args, script_stem="qwenv4"):
+    """开启运行日志 tee；终端原样显示，文件包含完整明文和线程信息。"""
+    raw_path = str(getattr(args, "log_file", "") or "").strip()
+    log_path = Path(raw_path) if raw_path else _default_log_file(script_stem)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    trim_log_file_to_limit(log_path)
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+    state = RunLoggingState(log_path, log_file, sys.stdout, sys.stderr)
+    sys.stdout = _ThreadAwareTee(state.stdout, log_file, "stdout", log_path, RUN_LOG_MAX_BYTES)
+    sys.stderr = _ThreadAwareTee(state.stderr, log_file, "stderr", log_path, RUN_LOG_MAX_BYTES)
+    return state
+
+
+def close_run_logging(state):
+    """关闭运行日志 tee 并恢复 stdout/stderr。"""
+    if state is None or getattr(state, "closed", False):
+        return
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        sys.stdout = state.stdout
+        sys.stderr = state.stderr
+        state.log_file.close()
+        state.closed = True
 
 
 def is_generator_provider(provider_type):
@@ -295,7 +418,7 @@ def build_qwen2api_sync_config(args):
 
 def build_captcha_solver_config(args):
     """从命令行参数构造滑块验证码处理配置。"""
-    captcha_solver = "manual" if getattr(args, "captcha_record_only", False) else getattr(args, "captcha_solver", "manual")
+    captcha_solver = "manual" if getattr(args, "captcha_record_only", False) else getattr(args, "captcha_solver", "ddddocr")
     if getattr(args, "captcha_record_only", False):
         setattr(args, "captcha_record_trace", True)
     if getattr(args, "captcha_record_trace", False):
@@ -312,18 +435,32 @@ def build_captcha_solver_config(args):
         os.environ["CAPTCHA_DRAG_STRATEGY"] = drag_strategy
     elif drag_strategy in {"auto", "closed_loop"}:
         os.environ.pop("CAPTCHA_DRAG_STRATEGY", None)
+    target_right_bias = getattr(args, "captcha_target_right_bias", None)
+    if target_right_bias is not None:
+        os.environ["CAPTCHA_TARGET_RIGHT_BIAS"] = str(float(target_right_bias))
     if getattr(args, "captcha_callback_bypass", False):
         os.environ["CAPTCHA_CALLBACK_BYPASS"] = "1"
     if getattr(args, "captcha_force_verify_success", False):
         os.environ["CAPTCHA_FORCE_VERIFY_SUCCESS"] = "1"
+    if captcha_solver == "ddddocr":
+        attempts = 3
+        fallback_manual = False
+    elif captcha_solver == "ai":
+        attempts = getattr(args, "captcha_ai_attempts", DEFAULT_CAPTCHA_AI_ATTEMPTS)
+        fallback_manual = False
+    else:
+        attempts = getattr(args, "captcha_ai_attempts", DEFAULT_CAPTCHA_AI_ATTEMPTS)
+        fallback_manual = False
     return CaptchaSolverConfig(
-        enabled=captcha_solver == "ai",
+        enabled=captcha_solver in {"ddddocr", "ai"},
+        mode=captcha_solver,
         base_url=getattr(args, "captcha_ai_base_url", DEFAULT_CAPTCHA_AI_BASE_URL),
         api_key=getattr(args, "captcha_ai_api_key", os.getenv("CAPTCHA_AI_API_KEY", "")),
         model=getattr(args, "captcha_ai_model", DEFAULT_CAPTCHA_AI_MODEL),
         timeout=getattr(args, "captcha_ai_timeout", DEFAULT_CAPTCHA_AI_TIMEOUT),
-        attempts=getattr(args, "captcha_ai_attempts", DEFAULT_CAPTCHA_AI_ATTEMPTS),
-        fallback_manual=not getattr(args, "no_captcha_ai_fallback_manual", False),
+        attempts=attempts,
+        fallback_manual=fallback_manual,
+        overall_timeout=getattr(args, "captcha_timeout", 0) if captcha_solver == "ai" else 0,
     )
 
 
@@ -919,6 +1056,117 @@ def wait_for_email(inbox_page, timeout=300, keywords=('qwen', 'alibaba')):
 # Qwen Registration (增强版)
 # ──────────────────────────────────────────────────────────
 
+def submit_registration_form_background(page, name, email, password):
+    """用 DOM 合成事件后台填写并提交注册表单，避免并发窗口抢占前台焦点。"""
+    page.wait_for_selector('input[name="username"]', timeout=20000)
+    script = """
+    ({ name, email, password }) => {
+      const setInputValue = (selector, value) => {
+        const element = document.querySelector(selector);
+        if (!element) {
+          throw new Error(`缺少表单字段: ${selector}`);
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+        descriptor.set.call(element, value);
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+
+      setInputValue('input[name="username"]', name);
+      setInputValue('input[name="email"]', email);
+      setInputValue('input[name="password"]', password);
+      setInputValue('input[name="checkPassword"]', password);
+
+      const checkbox = document.querySelector('input[type="checkbox"]');
+      if (checkbox) {
+        const checkedDescriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+        checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        checkedDescriptor.set.call(checkbox, true);
+        checkbox.dispatchEvent(new Event('input', { bubbles: true }));
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const submitButton = buttons.find(button => {
+        const text = (button.innerText || button.textContent || '').trim().toLowerCase();
+        return text.includes('create account') || text.includes('创建账号');
+      }) || buttons.find(button => button.type === 'submit');
+      if (!submitButton) {
+        throw new Error('缺少创建账号按钮');
+      }
+      submitButton.disabled = false;
+      submitButton.removeAttribute('disabled');
+      submitButton.setAttribute('aria-disabled', 'false');
+      submitButton.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+      submitButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      submitButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      submitButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      if (typeof submitButton.click === 'function') {
+        submitButton.click();
+      }
+      return true;
+    }
+    """
+    return bool(page.evaluate(script, {"name": name, "email": email, "password": password}))
+
+
+def focus_page_for_slider(page, label="", attempts=3, delay=0.3):
+    """激活滑块页面并确认可见/焦点状态，避免 OS 鼠标拖到错误窗口。"""
+    prefix = f"{label} " if label else ""
+    total_attempts = max(1, int(attempts))
+    last_state = None
+    use_os_focus = os.name == "nt" and os.getenv("CAPTCHA_DRAG_BACKEND", "playwright").strip().lower() == "os"
+    for attempt in range(1, total_attempts + 1):
+        print(f"  🪟 {prefix}正在激活滑块窗口 ({attempt}/{total_attempts})", flush=True)
+        if use_os_focus:
+            os_focused = ensure_page_foreground(page, label=label, attempts=1, delay=delay)
+        else:
+            os_focused = True
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+            try:
+                page.evaluate("() => window.focus()")
+            except Exception:
+                pass
+        try:
+            focused = bool(page.evaluate("() => document.visibilityState === 'visible' && document.hasFocus()"))
+        except Exception:
+            focused = False
+        if os_focused and focused:
+            print(f"  ✅ {prefix}滑块窗口焦点确认成功", flush=True)
+            return True
+        try:
+            last_state = page.evaluate(
+                "() => ({ visibilityState: document.visibilityState, hasFocus: document.hasFocus(), url: location.href })"
+            )
+            if isinstance(last_state, dict):
+                path = urllib.parse.urlparse(str(last_state.get("url", ""))).path or "/"
+                print(
+                    f"  ⚠️ {prefix}滑块窗口焦点状态: "
+                    f"visibilityState={last_state.get('visibilityState')} "
+                    f"hasFocus={last_state.get('hasFocus')} path={path}",
+                    flush=True,
+                )
+        except Exception as e:
+            last_state = {"error": str(e)}
+            print(f"  ⚠️ {prefix}滑块窗口焦点状态读取失败: {e}", flush=True)
+        if attempt < total_attempts:
+            time.sleep(delay)
+    if isinstance(last_state, dict) and "error" not in last_state:
+        path = urllib.parse.urlparse(str(last_state.get("url", ""))).path or "/"
+        print(
+            f"  ❌ {prefix}滑块窗口焦点确认失败 "
+            f"(visibilityState={last_state.get('visibilityState')}, "
+            f"hasFocus={last_state.get('hasFocus')}, path={path})",
+            flush=True,
+        )
+    else:
+        print(f"  ❌ {prefix}滑块窗口焦点确认失败", flush=True)
+    return False
+
+
 def register_qwen(
     page,
     name,
@@ -938,40 +1186,7 @@ def register_qwen(
 
     try:
         page.goto(QWEN_REGISTER_URL, wait_until='domcontentloaded', timeout=60000)
-        # 等待表单加载
-        page.wait_for_selector('input[name="username"]', timeout=20000)
-        time.sleep(3)
-
-        # 填写表单，逐字段等待
-        page.fill('input[name="username"]', name)
-        time.sleep(0.8)
-        page.fill('input[name="email"]', email)
-        time.sleep(0.8)
-        page.fill('input[name="password"]', password)
-        time.sleep(0.8)
-        page.fill('input[name="checkPassword"]', password)
-        time.sleep(0.8)
-
-        # 勾选用户条款
-        try:
-            page.check('input[type="checkbox"]')
-            time.sleep(0.5)
-        except Exception:
-            pass
-
-        # 点击提交按钮
-        submit_btn = page.locator('button:has-text("Create Account"), button:has-text("创建账号")')
-        submit_btn.scroll_into_view_if_needed()
-        time.sleep(1)
-
-        try:
-            with page.expect_navigation(wait_until='domcontentloaded', timeout=30000):
-                submit_btn.click()
-        except PlaywrightTimeout:
-            # 导航超时是正常的 — 表单可能已提交但没有重定向
-            pass
-        except Exception:
-            pass
+        submit_registration_form_background(page, name=name, email=email, password=password)
 
         time.sleep(5)
 
@@ -981,10 +1196,8 @@ def register_qwen(
             label_prefix = f"{label} " if label else ""
             try:
                 with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
-                    try:
-                        page.bring_to_front()
-                    except Exception:
-                        pass
+                    if not focus_page_for_slider(page, label=label):
+                        return False
 
                     if not detect_captcha(page):
                         print(f"  ✅ {label_prefix}验证码已在等待期间完成")
@@ -1098,8 +1311,9 @@ def register_qwen(
         print(f"  ⚠️ 操作超时: {str(e)[:100]}")
         try:
             body = page.evaluate('document.body.innerText') or ''
-            if 'create account' not in body.lower():
-                print("  ✅ 虽然发生超时，但表单可能已提交")
+            body_lower = body.lower()
+            if '待激活' in body or '激活账号' in body or 'pending activation' in body_lower or 'verification email' in body_lower:
+                print("  ✅ 虽然发生超时，但已检测到注册提交状态")
                 return True
         except Exception:
             pass
@@ -1118,6 +1332,22 @@ def register_qwen(
 # ──────────────────────────────────────────────────────────
 
 def run_single_account(account_index, total_accounts, args, proxy_str=None):
+    """执行单个账号编号；失败时可换新邮箱/浏览器代理补偿重试。"""
+    max_attempts = max(1, int(getattr(args, "account_retries", 1) or 1))
+    for attempt in range(1, max_attempts + 1):
+        if STOP_EVENT.is_set():
+            return False
+        if max_attempts > 1:
+            print(f"\n🔁 [账号 {account_index}/{total_accounts}] 第 {attempt}/{max_attempts} 次尝试")
+        if _run_single_account_once(account_index, total_accounts, args, proxy_str):
+            return True
+        if attempt < max_attempts and not STOP_EVENT.is_set():
+            print(f"  🔁 [账号 {account_index}/{total_accounts}] 本次尝试失败，准备更换邮箱和浏览器代理重试...")
+            sleep_interruptible(0.5)
+    return False
+
+
+def _run_single_account_once(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号注册任务；每个线程独立创建 Playwright 实例。"""
     label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
@@ -1148,11 +1378,12 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                 print(f"  🛑 {label} 已收到停止请求，跳过")
                 return False
             try:
-                browser = p.chromium.launch(
-                    headless=HEADLESS,
-                    args=BROWSER_ARGS,
-                    proxy=proxy_dict,
-                )
+                with acquire_foreground_window_lock(label=f"{label} 浏览器启动", stop_event=STOP_EVENT):
+                    browser = p.chromium.launch(
+                        headless=HEADLESS,
+                        args=BROWSER_ARGS,
+                        proxy=proxy_dict,
+                    )
             except Exception as e:
                 print(f"  ❌ {label} 浏览器启动失败: {e}")
                 return False
@@ -1196,7 +1427,8 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                 print(f"  👤 {label} 用户名:  {name}")
                 print(f"  🔑 {label} 密码:    {password}")
 
-                qwen = context.new_page()
+                with acquire_foreground_window_lock(label=f"{label} 新建注册页", stop_event=STOP_EVENT):
+                    qwen = context.new_page()
                 install_aliyun_callback_probe(qwen)
                 if getattr(args, "captcha_force_verify_success", False):
                     install_aliyun_verify_success_route(qwen)
@@ -1304,51 +1536,59 @@ def main():
     start_parent_stop_file_watcher()
 
     args = parse_args()
-    num_accounts = args.count
-    if num_accounts is None:
-        try:
-            num_accounts = positive_int(input("📊 要创建多少个账号？ "))
-        except (argparse.ArgumentTypeError, ValueError, EOFError):
-            print("❌ 数量无效")
-            sys.exit(1)
-
-    os.makedirs(IMAGES_DIR, exist_ok=True)
-
-    print(f"\n🎯 准备创建 {num_accounts} 个 Qwen 账号...")
-    print(f"📮 邮箱服务: {args.email_provider}")
-    if args.api_proxy and not is_generator_provider(args.email_provider):
-        print(f"🔌 API 代理: {args.api_proxy}")
-    if args.browser_proxy:
-        print("🌐 浏览器代理: 已配置（每个账号启动时动态解析）")
-    print(f"🚦 并发数量: {args.concurrency}")
-    minutes = args.captcha_timeout // 60
-    minute_text = f" / {minutes}分钟" if minutes else ""
-    print(f"🤖 滑块等待: {args.captcha_timeout}s{minute_text}")
-    if args.captcha_record_only:
-        print("🧠 滑块自动处理: 已禁用（只录制人工轨迹）")
-    elif args.captcha_solver == "ai":
-        fallback_text = "启用" if not args.no_captcha_ai_fallback_manual else "禁用"
-        print(f"🧠 滑块自动处理: 已启用（优先 ddddocr，AI 模型 {args.captcha_ai_model}，人工回退{fallback_text}）")
-    else:
-        print("🧠 滑块自动处理: 未启用")
-    if args.captcha_record_trace or args.captcha_record_only:
-        print("🎥 滑块轨迹录制: 已启用（人工通过后会保存 manual_trace_*.json）")
-    if args.captcha_replay_trace:
-        print(f"🎞️ 滑块轨迹重放: {args.captcha_replay_trace}")
-    print(f"🖱️ 滑块拖动后端: {args.captcha_drag_backend}")
-    print(f"🧭 滑块拖动策略: {args.captcha_drag_strategy}")
-    if args.captcha_callback_bypass:
-        print("🧪 本地靶场回调实验: 已启用")
-    if args.captcha_force_verify_success:
-        print("🧪 本地靶场 Verify 响应替换: 已启用")
-    if args.sync_qwen2api:
-        print(f"🔁 qwen2API 同步: 已启用（{args.qwen2api_base_url}）")
-    else:
-        print("🔁 qwen2API 同步: 未启用")
-    print("🔒 严格模式: 已启用（不会自动降级）\n")
-
+    logging_state = enable_run_logging(args, script_stem="qwenv4")
     success_count = 0
     try:
+        print(f"🧾 运行日志: {logging_state.path}")
+        num_accounts = args.count
+        if num_accounts is None:
+            try:
+                num_accounts = positive_int(input("📊 要创建多少个账号？ "))
+            except (argparse.ArgumentTypeError, ValueError, EOFError):
+                print("❌ 数量无效")
+                sys.exit(1)
+
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+
+        print(f"\n🎯 准备创建 {num_accounts} 个 Qwen 账号...")
+        print(f"📮 邮箱服务: {args.email_provider}")
+        if args.api_proxy and not is_generator_provider(args.email_provider):
+            print(f"🔌 API 代理: {args.api_proxy}")
+        if args.browser_proxy:
+            print("🌐 浏览器代理: 已配置（每个账号启动时动态解析）")
+        print(f"🚦 并发数量: {args.concurrency}")
+        if args.captcha_record_only:
+            print("🧠 滑块自动处理: 已禁用（只录制人工轨迹）")
+        elif args.captcha_solver == "ddddocr":
+            print("🧠 滑块处理: ddddocr 本地自动（最多 3 次，失败不回退人工）")
+        elif args.captcha_solver == "ai":
+            minutes = args.captcha_timeout // 60
+            minute_text = f" / {minutes}分钟" if minutes else ""
+            print(f"🤖 滑块 AI 超时: {args.captcha_timeout}s{minute_text}")
+            print(f"🧠 滑块处理: 远程 AI（模型 {args.captcha_ai_model}，失败不回退人工）")
+        else:
+            minutes = args.captcha_timeout // 60
+            minute_text = f" / {minutes}分钟" if minutes else ""
+            print(f"🤖 人工滑块等待: {args.captcha_timeout}s{minute_text}")
+            print("🧠 滑块处理: 人工")
+        if args.captcha_record_trace or args.captcha_record_only:
+            print("🎥 滑块轨迹录制: 已启用（人工通过后会保存 manual_trace_*.json）")
+        if args.captcha_replay_trace:
+            print(f"🎞️ 滑块轨迹重放: {args.captcha_replay_trace}")
+        print(f"🖱️ 滑块拖动后端: {args.captcha_drag_backend}")
+        print(f"🧭 滑块拖动策略: {args.captcha_drag_strategy}")
+        if args.captcha_target_right_bias is not None:
+            print(f"🎚️ 滑块释放目标右偏: {float(args.captcha_target_right_bias):+.1f}px")
+        if args.captcha_callback_bypass:
+            print("🧪 本地靶场回调实验: 已启用")
+        if args.captcha_force_verify_success:
+            print("🧪 本地靶场 Verify 响应替换: 已启用")
+        if args.sync_qwen2api:
+            print(f"🔁 qwen2API 同步: 已启用（{args.qwen2api_base_url}）")
+        else:
+            print("🔁 qwen2API 同步: 未启用")
+        print("🔒 严格模式: 已启用（不会自动降级）\n")
+
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             futures = submit_account_futures(
                 executor,
@@ -1373,6 +1613,7 @@ def main():
         print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
         print(f"{'═'*60}")
     finally:
+        close_run_logging(logging_state)
         if previous_sigint is not None:
             try:
                 signal.signal(signal.SIGINT, previous_sigint)

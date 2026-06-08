@@ -49,6 +49,7 @@ function Load-StartConfig([string]$Path) {
         browser_proxy = ""
         concurrency = 1
         captcha_timeout = 600
+        captcha_solver = "ddddocr"
         verbose = $false
         sync_qwen2api = $false
         qwen2api_base_url = "http://127.0.0.1:7860"
@@ -60,7 +61,7 @@ function Load-StartConfig([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
         try {
             $loaded = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($key in @("count", "email_provider", "api_proxy", "browser_proxy", "concurrency", "captcha_timeout", "verbose", "sync_qwen2api", "qwen2api_base_url", "qwen2api_admin_key", "qwen2api_timeout", "strict")) {
+            foreach ($key in @("count", "email_provider", "api_proxy", "browser_proxy", "concurrency", "captcha_timeout", "captcha_solver", "verbose", "sync_qwen2api", "qwen2api_base_url", "qwen2api_admin_key", "qwen2api_timeout", "strict")) {
                 if ($loaded.PSObject.Properties.Name -contains $key) {
                     $config[$key] = $loaded.$key
                 }
@@ -85,6 +86,7 @@ function Save-StartConfig([string]$Path, [hashtable]$Config) {
         browser_proxy = [string]$Config.browser_proxy
         concurrency = [int]$Config.concurrency
         captcha_timeout = [int]$Config.captcha_timeout
+        captcha_solver = [string]$Config.captcha_solver
         verbose = [bool]$Config.verbose
         sync_qwen2api = [bool]$Config.sync_qwen2api
         qwen2api_base_url = [string]$Config.qwen2api_base_url
@@ -160,6 +162,45 @@ function Prompt-Provider([string]$DefaultValue) {
             return $provider
         }
         Write-Host "请输入 1/2/3 或 generator.email/mailtm/mailporary。"
+    }
+}
+
+function Normalize-CaptchaSolver([string]$RawValue) {
+    $value = $RawValue.Trim().ToLowerInvariant()
+    switch ($value) {
+        "1" { return "ddddocr" }
+        "ddddocr" { return "ddddocr" }
+        "ocr" { return "ddddocr" }
+        "2" { return "ai" }
+        "ai" { return "ai" }
+        "滑块ai" { return "ai" }
+        "3" { return "manual" }
+        "manual" { return "manual" }
+        "人工" { return "manual" }
+        default { return $null }
+    }
+}
+
+function Prompt-CaptchaSolver([string]$DefaultValue) {
+    $normalizedDefault = Normalize-CaptchaSolver $DefaultValue
+    if ($null -eq $normalizedDefault) {
+        $normalizedDefault = "ddddocr"
+    }
+
+    while ($true) {
+        Write-Host "滑块处理方式:"
+        Write-Host "  1) ddddocr（本地自动，默认）"
+        Write-Host "  2) 滑块AI"
+        Write-Host "  3) 人工"
+        $raw = Read-LineValue "请选择滑块处理方式 [$normalizedDefault]: "
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $normalizedDefault
+        }
+        $solver = Normalize-CaptchaSolver $raw
+        if ($null -ne $solver) {
+            return $solver
+        }
+        Write-Host "请输入 1/2/3 或 ddddocr/ai/manual。"
     }
 }
 
@@ -553,7 +594,11 @@ try {
     $browserProxy = Prompt-String "浏览器代理（输入 none 可清空）" ([string]$config.browser_proxy)
     $verbose = Prompt-Bool "启用详细日志?" ([bool]$config.verbose)
     $concurrency = Prompt-RangedInt "并发数量" ([int]$config.concurrency) 1 10
-    $captchaTimeout = Prompt-PositiveInt "滑块验证等待秒数" ([int]$config.captcha_timeout)
+    $captchaSolver = Prompt-CaptchaSolver ([string]$config.captcha_solver)
+    $captchaTimeout = [int]$config.captcha_timeout
+    if ($captchaSolver -in @("ai", "manual")) {
+        $captchaTimeout = Prompt-PositiveInt "滑块验证等待/超时秒数" $captchaTimeout
+    }
     $syncQwen2Api = Prompt-Bool "同步到 qwen2API?" ([bool]$config.sync_qwen2api)
     $qwen2ApiBaseUrl = [string]$config.qwen2api_base_url
     $qwen2ApiAdminKey = [string]$config.qwen2api_admin_key
@@ -576,6 +621,7 @@ try {
         browser_proxy = $browserProxy
         concurrency = $concurrency
         captcha_timeout = $captchaTimeout
+        captcha_solver = $captchaSolver
         verbose = $verbose
         sync_qwen2api = $syncQwen2Api
         qwen2api_base_url = $qwen2ApiBaseUrl
@@ -586,6 +632,9 @@ try {
     Save-StartConfig $ResolvedConfigPath $newConfig
     Write-Info "已保存本次参数: $ResolvedConfigPath"
 
+    $logDir = Join-Path $ProjectRoot "logs"
+    $logFile = Join-Path $logDir "qwenv4.log"
+
     $scriptArgs = @("qwenv4.py", [string]$count, "--email-provider", $provider)
     if (-not [string]::IsNullOrWhiteSpace($apiProxy)) {
         $scriptArgs += @("--api-proxy", $apiProxy)
@@ -593,8 +642,17 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($browserProxy)) {
         $scriptArgs += @("--browser-proxy", $browserProxy)
     }
-    $scriptArgs += @("--concurrency", [string]$concurrency, "--captcha-timeout", [string]$captchaTimeout)
-    $scriptArgs += @("--captcha-solver", "ai", "--captcha-ai-attempts", "3", "--no-captcha-ai-fallback-manual", "--captcha-drag-backend", "os", "--captcha-drag-strategy", "fast_quadratic")
+    $scriptArgs += @("--concurrency", [string]$concurrency, "--account-retries", "3")
+    if ($captchaSolver -eq "ddddocr") {
+        $scriptArgs += @("--captcha-solver", "ddddocr", "--captcha-ai-attempts", "3", "--no-captcha-ai-fallback-manual", "--captcha-drag-backend", "os", "--captcha-drag-strategy", "fast_quadratic")
+    } elseif ($captchaSolver -eq "ai") {
+        if ([string]::IsNullOrWhiteSpace($env:CAPTCHA_AI_API_KEY)) {
+            throw "选择滑块AI模式需要先设置环境变量 CAPTCHA_AI_API_KEY"
+        }
+        $scriptArgs += @("--captcha-solver", "ai", "--captcha-timeout", [string]$captchaTimeout, "--captcha-ai-attempts", "3", "--no-captcha-ai-fallback-manual", "--captcha-drag-backend", "os", "--captcha-drag-strategy", "fast_quadratic")
+    } else {
+        $scriptArgs += @("--captcha-solver", "manual", "--captcha-timeout", [string]$captchaTimeout)
+    }
     if ($syncQwen2Api) {
         $scriptArgs += @(
             "--sync-qwen2api",
@@ -606,6 +664,7 @@ try {
     if ($verbose) {
         $scriptArgs += "--verbose"
     }
+    $scriptArgs += @("--log-file", $logFile)
     $scriptArgs += "--strict"
 
     $displayCommand = Format-CommandForDisplay $scriptArgs
@@ -640,3 +699,5 @@ try {
     Write-Error $_.Exception.Message
     exit 1
 }
+
+

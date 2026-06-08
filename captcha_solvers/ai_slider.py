@@ -22,6 +22,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
 import httpx
+from captcha_solvers.window_focus import ensure_page_foreground
 try:  # pragma: no cover - 依赖缺失时运行时会自动降级到 AI 估算。
     from PIL import Image
 except Exception:  # pragma: no cover
@@ -63,12 +64,14 @@ class CaptchaSolverConfig:
     """AI 滑块求解配置。"""
 
     enabled: bool = False
+    mode: str = ""
     base_url: str = DEFAULT_CAPTCHA_AI_BASE_URL
     api_key: str = ""
     model: str = DEFAULT_CAPTCHA_AI_MODEL
     timeout: int = DEFAULT_CAPTCHA_AI_TIMEOUT
     attempts: int = DEFAULT_CAPTCHA_AI_ATTEMPTS
     fallback_manual: bool = True
+    overall_timeout: int = 0
 
 
 @dataclass(frozen=True)
@@ -164,17 +167,34 @@ def solve_slider_captcha(
         return CaptchaSolverResult(ok=False, message="AI 滑块处理未启用")
     Path(image_dir).mkdir(parents=True, exist_ok=True)
     ai_client: Optional[CaptchaAiClient] = client
+    mode = (config.mode or ("ai" if (config.api_key or client is not None) else "ddddocr")).strip().lower()
+    if mode not in {"ddddocr", "ai"}:
+        mode = "ai"
+    if mode == "ai" and not config.api_key:
+        return CaptchaSolverResult(ok=False, message="未配置滑块 AI API 密钥", attempts=0)
+    deadline = None
+    if mode == "ai" and int(config.overall_timeout or 0) > 0:
+        deadline = time.monotonic() + int(config.overall_timeout)
+
+    def timed_out() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
 
     last_message = "尚未尝试"
     last_distance: Optional[int] = None
     last_screenshot: Optional[str] = None
+    last_corrected_target_x: Optional[float] = None
+    last_target_signature: Optional[tuple[Optional[float], Optional[float], Optional[float], str]] = None
+    repeated_target_index = 0
     network_debug = _attach_captcha_network_debug(page, prefix) if os.getenv("CAPTCHA_DEBUG_NETWORK") else None
 
     for attempt in range(1, max(1, config.attempts) + 1):
         try:
+            if timed_out():
+                return CaptchaSolverResult(ok=False, message="AI 滑块处理整体超时", attempts=attempt - 1)
             if _is_cancelled(stop_event):
                 return CaptchaSolverResult(ok=False, message="AI 滑块处理已取消", attempts=attempt - 1)
-            print(f"  🤖 {prefix}AI 正在尝试处理滑块（第 {attempt}/{config.attempts} 次）")
+            mode_text = "ddddocr" if mode == "ddddocr" else "AI"
+            print(f"  🤖 {prefix}{mode_text} 正在尝试处理滑块（第 {attempt}/{config.attempts} 次）")
             root = _find_captcha_root(page)
             if root is None:
                 return CaptchaSolverResult(ok=True, message="未检测到可见滑块验证码", attempts=attempt - 1)
@@ -206,6 +226,18 @@ def solve_slider_captcha(
                     _dump_captcha_network_debug(network_debug, prefix)
                     _dump_captcha_dom_debug(page, prefix)
 
+            if (
+                os.name == "nt"
+                and os.getenv("CAPTCHA_DRAG_BACKEND", "playwright").strip().lower() == "os"
+                and hasattr(page, "bring_to_front")
+                and hasattr(page, "evaluate")
+                and not ensure_page_foreground(page, label=label, attempts=2, delay=0.2)
+            ):
+                last_message = "OS 前台焦点确认失败"
+                print(f"  ⚠️ {prefix}{last_message}，重新聚焦后重试")
+                _sleep(0.5, stop_event)
+                continue
+
             screenshot_path = str(Path(image_dir) / f"captcha_ai_{int(time.time() * 1000)}_{attempt}.png")
             _screenshot_locator(root, screenshot_path)
             last_screenshot = screenshot_path
@@ -214,7 +246,7 @@ def solve_slider_captcha(
             drag_plan = _build_drag_plan(page, root, 0)
             drag_plan["label"] = label
             ai_distance = 0
-            if os.getenv("CAPTCHA_AI_FORCE_DISTANCE", "").strip() and config.api_key:
+            if mode == "ai" and os.getenv("CAPTCHA_AI_FORCE_DISTANCE", "").strip() and config.api_key:
                 if ai_client is None:
                     ai_client = CaptchaAiClient(
                         base_url=config.base_url,
@@ -235,7 +267,28 @@ def solve_slider_captcha(
                 drag_plan["alternatives"] = [scaled_ai_distance]
                 drag_plan["ai_distance_scale"] = ai_scale
             local_source = drag_plan.get("source")
-            if local_source in {"ddddocr", "图像匹配校准", "AI强制距离"}:
+            if mode == "ddddocr" and local_source not in {"ddddocr", "图像匹配校准"}:
+                last_message = "ddddocr 本地识别未能得到可用滑块缺口"
+                print(f"  ⚠️ {prefix}{last_message}，尝试刷新后重试")
+                _try_refresh_captcha(root)
+                _sleep(0.5, stop_event)
+                continue
+            if mode == "ai":
+                if ai_client is None:
+                    ai_client = CaptchaAiClient(
+                        base_url=config.base_url,
+                        api_key=config.api_key,
+                        model=config.model,
+                        timeout=config.timeout,
+                    )
+                if timed_out():
+                    return CaptchaSolverResult(ok=False, message="AI 滑块处理整体超时", attempts=attempt - 1)
+                print(f"  🌐 {prefix}正在请求滑块 AI 识别距离...")
+                ai_distance = ai_client.ask_slider_distance(screenshot_path)
+                drag_plan = _build_drag_plan(page, root, ai_distance)
+                drag_plan["label"] = label
+                local_source = drag_plan.get("source")
+            elif local_source in {"ddddocr", "图像匹配校准", "AI强制距离"}:
                 print(f"  🧩 {prefix}{local_source} 已识别滑块缺口，优先使用本地距离")
             else:
                 if ai_client is None:
@@ -256,9 +309,40 @@ def solve_slider_captcha(
                 ai_distance = ai_client.ask_slider_distance(screenshot_path)
                 drag_plan = _build_drag_plan(page, root, ai_distance)
                 drag_plan["label"] = label
-            alternatives = drag_plan.get("alternatives") or [drag_plan["distance"]]
-            if isinstance(alternatives, list) and alternatives:
-                drag_plan["distance"] = float(alternatives[(attempt - 1) % len(alternatives)])
+            current_signature = _drag_plan_target_signature(drag_plan)
+            same_target_signature = current_signature == last_target_signature
+            if same_target_signature:
+                repeated_target_index += 1
+            else:
+                repeated_target_index = 0
+                last_corrected_target_x = None
+            last_target_signature = current_signature
+            target_alternatives = drag_plan.get("target_x_alternatives")
+            if last_corrected_target_x is not None:
+                if isinstance(target_alternatives, list):
+                    base_targets = list(target_alternatives)
+                    if all(abs(float(last_corrected_target_x) - float(seen)) >= 3.0 for seen in base_targets):
+                        target_alternatives = base_targets[:2] + [last_corrected_target_x] + base_targets[2:]
+                    else:
+                        target_alternatives = base_targets
+                else:
+                    target_alternatives = [last_corrected_target_x]
+            if isinstance(target_alternatives, list) and target_alternatives and drag_plan.get("calibrate_target_x") is not None:
+                selected_target_index = repeated_target_index % len(target_alternatives)
+                raw_target_x = float(target_alternatives[selected_target_index])
+                max_distance = float(drag_plan.get("max_distance", max(float(drag_plan["distance"]), 20.0)))
+                scale = float(drag_plan.get("target_scale", 1.0) or 1.0)
+                target_x = _apply_target_right_bias(raw_target_x, max_distance)
+                drag_plan["calibrate_target_x"] = target_x
+                drag_plan["distance"] = max(20.0, min(target_x * scale, max_distance))
+                drag_plan["selected_target_x"] = target_x
+                drag_plan["raw_selected_target_x"] = raw_target_x
+                drag_plan["target_right_bias"] = target_x - raw_target_x
+                drag_plan["selected_target_index"] = selected_target_index
+            else:
+                alternatives = drag_plan.get("alternatives") or [drag_plan["distance"]]
+                if isinstance(alternatives, list) and alternatives:
+                    drag_plan["distance"] = float(alternatives[(attempt - 1) % len(alternatives)])
             source = drag_plan.get("source", "AI")
             planned_distance = int(round(float(drag_plan["distance"])))
             if any(drag_plan.get(key) is not None for key in ("ddddocr_target_x", "white_gap_target_x", "match_target_x")):
@@ -267,6 +351,20 @@ def solve_slider_captcha(
                     f"ddddocr={_format_optional_px(drag_plan.get('ddddocr_target_x'))}, "
                     f"亮色缺口={_format_optional_px(drag_plan.get('white_gap_target_x'))}, "
                     f"模板匹配={_format_optional_px(drag_plan.get('match_target_x'))}"
+                )
+            target_right_bias = drag_plan.get("target_right_bias")
+            raw_selected_target_x = drag_plan.get("raw_selected_target_x")
+            selected_target_x = drag_plan.get("selected_target_x")
+            if (
+                target_right_bias is not None
+                and raw_selected_target_x is not None
+                and selected_target_x is not None
+                and abs(float(target_right_bias)) >= 0.1
+            ):
+                print(
+                    f"  🎚️ {prefix}释放目标右偏: "
+                    f"{float(raw_selected_target_x):.1f}px -> {float(selected_target_x):.1f}px "
+                    f"({float(target_right_bias):+.1f}px)"
                 )
             if ai_distance:
                 print(f"  📏 {prefix}AI 估算距离: {ai_distance}px，{source} 计划拖动: {planned_distance}px")
@@ -282,6 +380,14 @@ def solve_slider_captcha(
             if adjustment:
                 applied_adjustment = drag_plan.get("applied_local_adjustment", adjustment)
                 print(f"  🧭 {prefix}本地微调: 建议 {float(adjustment):+.1f}px，实际 {float(applied_adjustment):+.1f}px")
+            release_backoff = drag_plan.get("release_backoff")
+            if isinstance(release_backoff, dict):
+                print(
+                    f"  ↩️ {prefix}释放前回拉: "
+                    f"delta {float(release_backoff.get('before_delta', 0)):+.1f}px"
+                    f" -> {float(release_backoff.get('after_delta', release_backoff.get('before_delta', 0))):+.1f}px, "
+                    f"回拉 {float(release_backoff.get('backoff', 0)):.1f}px"
+                )
             hold_state = drag_plan.get("hold_state")
             probe_state = drag_plan.get("probe_state")
             if isinstance(probe_state, dict):
@@ -328,6 +434,16 @@ def solve_slider_captcha(
                     f"sliderBoxX={_format_optional_px(hold_state.get('sliderBoxX'))}, "
                     f"puzzleBoxX={_format_optional_px(hold_state.get('puzzleBoxX'))}"
                 )
+                target_x = drag_plan.get("calibrate_target_x")
+                puzzle_left = hold_state.get("puzzleLeft")
+                if target_x is not None and puzzle_left is not None:
+                    try:
+                        delta = float(target_x) - float(puzzle_left)
+                        print(f"  📐 {prefix}松手前对齐: target={float(target_x):.1f}px puzzle={float(puzzle_left):.1f}px delta={delta:+.1f}px")
+                        if math.isfinite(delta) and abs(delta) > _alignment_target_tolerance() and abs(delta) <= 40.0:
+                            last_corrected_target_x = max(20.0, min(float(target_x) + delta, float(drag_plan.get("max_distance", 300.0))))
+                    except Exception:
+                        pass
             print(f"  🖱️ {prefix}实际拖动距离: {last_distance}px")
             success_source = _wait_for_captcha_success(
                 page,
@@ -1151,7 +1267,20 @@ def _wait_for_captcha_ready(page: Any, *, stop_event: Optional[Any] = None, time
                   const img = document.getElementById('aliyunCaptcha-img');
                   const puzzle = document.getElementById('aliyunCaptcha-puzzle');
                   const slider = document.getElementById('aliyunCaptcha-sliding-slider');
-                  if (!img && !puzzle && !slider) return {ready: true, aliyun: false, reason: '非 Aliyun 验证码'};
+                  const bodyText = document.body ? String(document.body.innerText || '') : '';
+                  const looksLikeAliyunLoading = (
+                    bodyText.includes('访问验证') ||
+                    bodyText.includes('验证您是真人') ||
+                    bodyText.includes('拖动滑块完成拼图') ||
+                    Boolean(document.querySelector('[id^="aliyunCaptcha"], [class*="aliyunCaptcha"]'))
+                  );
+                  if (!img && !puzzle && !slider) {
+                    return {
+                      ready: !looksLikeAliyunLoading,
+                      aliyun: looksLikeAliyunLoading,
+                      reason: looksLikeAliyunLoading ? 'Aliyun 验证码图片加载中' : '非 Aliyun 验证码'
+                    };
+                  }
                   const imageReady = el => {
                     if (!el) return false;
                     const src = String(el.currentSrc || el.src || '');
@@ -1237,6 +1366,26 @@ def _build_drag_plan(page: Any, root: Any, ai_distance: int) -> dict[str, float]
         return plan
     distance = _choose_drag_distance(ai_distance, geometry_distance)
     return {"start_x": start_x, "start_y": start_y, "distance": distance, "max_distance": geometry_distance, "source": "AI"}
+
+
+def _drag_plan_target_signature(plan: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float], str]:
+    def rounded(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            number = float(value)
+            if not math.isfinite(number):
+                return None
+            return round(number, 1)
+        except Exception:
+            return None
+
+    return (
+        rounded(plan.get("ddddocr_target_x")),
+        rounded(plan.get("white_gap_target_x")),
+        rounded(plan.get("match_target_x")),
+        str(plan.get("source") or ""),
+    )
 
 
 def _distance_alternatives(distance: float, max_distance: float) -> list[float]:
@@ -1403,10 +1552,19 @@ def _estimate_aliyun_slider_distance(page: Any, *, debug_prefix: str = "") -> Op
             calibrate_target_x = float(target_x)
         max_distance = max(20.0, track_width)
         distance = max(20.0, min(distance, max_distance))
+        target_alternatives = _target_x_alternatives(
+            chosen=float(target_x),
+            image_width=image_width,
+            ddddocr_x=ddddocr_x,
+            white_gap_x=float(white_gap_x) if white_gap_x is not None else None,
+            match_x=float(match_x) if match_x is not None else None,
+        )
         return {
             "distance": distance,
             "max_distance": float(max_distance),
             "calibrate_target_x": calibrate_target_x,
+            "target_x_alternatives": target_alternatives,
+            "target_scale": float(scale),
             "source": source,
             "ddddocr_target_x": float(ddddocr_x) if ddddocr_x is not None else None,
             "white_gap_target_x": float(white_gap_x) if white_gap_x is not None else None,
@@ -1593,13 +1751,20 @@ def _choose_aliyun_target_x(
             return float(fallback_x), "图像匹配校准"
         return None, "图像匹配校准"
 
+    # ddddocr 有时会把左侧待拖动拼图本身识别成目标；这类值通常只略高于
+    # min_real_target_x，而模板匹配会指向右侧真实缺口。没有白色缺口候选时，
+    # 若模板位置明显在右侧，优先使用模板，避免把滑块停在左半区。
+    if (
+        match_x is not None
+        and white_gap_x is None
+        and ddddocr_x < float(image_width) * 0.35
+        and float(match_x) >= min_real_target_x
+        and float(match_x) > ddddocr_x + 80.0
+    ):
+        return float(match_x), "图像匹配校准"
+
     if white_gap_x is not None and float(white_gap_x) >= min_real_target_x:
         white_delta = abs(float(white_gap_x) - ddddocr_x)
-        match_supports_white = (
-            match_x is not None
-            and float(match_x) >= min_real_target_x
-            and abs(float(match_x) - float(white_gap_x)) <= 28.0
-        )
         local_candidates_right_of_ddddocr = (
             match_x is not None
             and float(match_x) >= min_real_target_x
@@ -1607,8 +1772,35 @@ def _choose_aliyun_target_x(
             and float(white_gap_x) > ddddocr_x + 55.0
             and abs(float(match_x) - float(white_gap_x)) <= 45.0
         )
+        white_clearly_right = (
+            float(white_gap_x) > ddddocr_x + 35.0
+            and not local_candidates_right_of_ddddocr
+            and (
+                match_x is None
+                or float(match_x) <= ddddocr_x + 12.0
+                or abs(float(match_x) - float(white_gap_x)) <= 45.0
+            )
+        )
+        if white_clearly_right:
+            return float(white_gap_x), "图像匹配校准"
+        match_supports_white = (
+            match_x is not None
+            and float(match_x) >= min_real_target_x
+            and abs(float(match_x) - float(white_gap_x)) <= 28.0
+        )
         if local_candidates_right_of_ddddocr:
             return float(min(float(match_x), float(white_gap_x))), "图像匹配校准"
+        white_rescues_left_self_match = (
+            float(white_gap_x) > ddddocr_x + 45.0
+            and ddddocr_x < float(image_width) * 0.48
+            and (
+                match_x is None
+                or float(match_x) <= ddddocr_x + 90.0
+                or float(white_gap_x) > float(match_x) + 35.0
+            )
+        )
+        if white_rescues_left_self_match:
+            return float(white_gap_x), "图像匹配校准"
         # 白色缺口检测在浅色背景/水面上容易误检到真实缺口左侧。只有非常接近
         # ddddocr，或模板匹配也支持该位置时才优先使用它。
         template_points_right = (
@@ -1652,6 +1844,88 @@ def _local_target_is_more_consistent(
     return local_agrees and ddddocr_disagrees
 
 
+def _target_x_alternatives(
+    *,
+    chosen: float,
+    image_width: float,
+    ddddocr_x: Optional[float],
+    white_gap_x: Optional[float],
+    match_x: Optional[float],
+) -> list[float]:
+    """生成滑块目标坐标候选，供重试时真正更换 target_x。
+
+    优先尝试首选目标；随后尝试距离首选目标较近的模板/缺口/ocr 候选，且优先
+    右侧相邻候选。这样避免 ddddocr 偏左时三次都拖到同一个错误位置。
+    """
+    min_real_target_x = max(70.0, float(image_width) * 0.22)
+    max_real_target_x = max(min_real_target_x, float(image_width) - 20.0)
+
+    result: list[float] = []
+
+    def add(value: Optional[float]) -> None:
+        if value is None:
+            return
+        try:
+            number = float(value)
+        except Exception:
+            return
+        if not math.isfinite(number):
+            return
+        if number < min_real_target_x or number > max_real_target_x:
+            return
+        if all(abs(number - seen) >= 3.0 for seen in result):
+            result.append(number)
+
+    add(float(chosen))
+    raw_candidates = []
+    for value in (match_x, white_gap_x, ddddocr_x):
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except Exception:
+            continue
+        if not math.isfinite(number) or number < min_real_target_x or number > max_real_target_x:
+            continue
+        raw_candidates.append(number)
+
+    right_near = sorted(
+        [value for value in raw_candidates if value > float(chosen)],
+        key=lambda value: (abs(value - float(chosen)), value),
+    )
+    left_near = sorted(
+        [value for value in raw_candidates if value <= float(chosen)],
+        key=lambda value: (abs(value - float(chosen)), -value),
+    )
+    for value in right_near + left_near:
+        add(value)
+
+    # 如果视觉候选过少，最后用小幅左右偏移补齐，覆盖“只差一点点”的场景。
+    for offset in (6.0, -6.0, 10.0, -10.0):
+        add(float(chosen) + offset)
+    return result[:5]
+
+
+def _configured_target_right_bias() -> float:
+    raw = os.getenv("CAPTCHA_TARGET_RIGHT_BIAS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except Exception:
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return max(-12.0, min(value, 12.0))
+
+
+def _apply_target_right_bias(target_x: float, max_distance: float) -> float:
+    bias = _configured_target_right_bias()
+    if not bias:
+        return float(target_x)
+    return max(20.0, min(float(target_x) + bias, float(max_distance)))
+
+
 def _alpha_bbox(image: Any) -> Optional[tuple[int, int, int, int]]:
     if image.mode != "RGBA":
         image = image.convert("RGBA")
@@ -1672,7 +1946,9 @@ def _detect_white_gap_target_x(bg: Any) -> Optional[int]:
                 continue
             mx = max(r, g, b)
             mn = min(r, g, b)
-            if mx >= 180 and (mx - mn) <= 95 and not (b >= 225 and g >= 205 and r <= 235):
+            # 真实缺口在雪山/天空背景里经常是偏蓝白色，不能仅因 b/g 高就排除；
+            # 后续连通域尺寸、位置和形状过滤会排除大片天空/云层。
+            if mx >= 180 and (mx - mn) <= 95:
                 mask.add((x, y))
 
     if not mask:
@@ -1766,15 +2042,33 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
     mouse = _create_os_mouse_adapter(page, start_x, start_y, plan=plan) or page.mouse
     plan["drag_backend"] = "os" if isinstance(mouse, _WindowsOsMouseAdapter) else "playwright"
     _install_drag_event_debug(page)
+    uses_os_mouse = isinstance(mouse, _WindowsOsMouseAdapter)
 
     calibrate_target_x = plan.get("calibrate_target_x")
     use_probe_calibration = plan.get("source") == "ddddocr" and calibrate_target_x is not None
     distance = max(20.0, min(distance, max_distance))
 
+    if uses_os_mouse and not ensure_page_foreground(page, label=str(plan.get("label") or ""), attempts=2, delay=0.15):
+        plan["focus_missed"] = True
+        raise RuntimeError("OS 前台焦点确认失败，放弃拖动")
+
     _mouse_move(mouse, start_x, start_y, steps=3)
     time.sleep(random.uniform(0.22, 0.42))
+    if uses_os_mouse and not ensure_page_foreground(page, label=str(plan.get("label") or ""), attempts=1, delay=0.1):
+        plan["focus_missed"] = True
+        raise RuntimeError("OS 前台焦点确认失败，放弃按下滑块")
     mouse.down()
     time.sleep(random.uniform(0.25, 0.45))
+    if uses_os_mouse and not _drag_has_down_event(page):
+        plan["focus_missed"] = True
+        try:
+            mouse.up()
+        except Exception:
+            pass
+        debug_path = _dump_drag_event_debug(page, label=str(plan.get("label") or ""))
+        if debug_path:
+            plan["drag_event_debug"] = debug_path
+        raise RuntimeError("OS 鼠标按下未命中滑块窗口")
 
     trace_path = os.getenv("CAPTCHA_REPLAY_TRACE", "").strip()
     trace = _load_manual_trace(trace_path) if trace_path else None
@@ -1807,6 +2101,10 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
             plan["quadratic_strategy_distance"] = distance
             plan["fast_quadratic"] = True
             _drag_aliyun_fast_three_stage(mouse, start_x, start_y, distance)
+            if os.getenv("CAPTCHA_FAST_QUADRATIC_FINAL_ALIGNMENT", "").strip().lower() in {"1", "true", "yes", "y"}:
+                distance = _apply_final_alignment(
+                    page, mouse, plan, start_x, start_y, distance, max_distance, float(calibrate_target_x)
+                )
         elif drag_strategy == "ratio_human":
             probe_distance = max(60.0, min(distance, max_distance * 0.72))
             _drag_segment(mouse, start_x, start_y, 0.0, probe_distance, steps=random.randint(5, 9))
@@ -1854,14 +2152,65 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
             time.sleep(random.uniform(0.05, 0.16))
 
     hold_state = _get_aliyun_motion_state(page)
+    if uses_os_mouse and hold_state and calibrate_target_x is not None:
+        distance, hold_state = _apply_release_backoff_if_needed(
+            page,
+            mouse,
+            plan,
+            start_x,
+            start_y,
+            distance,
+            max_distance,
+            float(calibrate_target_x),
+            hold_state,
+        )
     if hold_state:
         plan["hold_state"] = hold_state
+        hold_screenshot = _capture_hold_screenshot(page, label=str(plan.get("label") or ""))
+        if hold_screenshot:
+            plan["hold_screenshot"] = hold_screenshot
+        anomaly = _drag_events_out_of_bounds(page, start_x=start_x, start_y=start_y, max_distance=max_distance)
+        if uses_os_mouse and anomaly is not None:
+            plan["drag_anomaly"] = anomaly
+            try:
+                mouse.up()
+            except Exception:
+                pass
+            debug_path = _dump_drag_event_debug(page, label=str(plan.get("label") or ""))
+            if debug_path:
+                plan["drag_event_debug"] = debug_path
+            raise RuntimeError(f"OS 鼠标轨迹异常: {anomaly}")
+        if uses_os_mouse and _motion_state_looks_focus_missed(hold_state):
+            plan["focus_missed"] = True
+            try:
+                mouse.up()
+            except Exception:
+                pass
+            debug_path = _dump_drag_event_debug(page, label=str(plan.get("label") or ""))
+            if debug_path:
+                plan["drag_event_debug"] = debug_path
+            raise RuntimeError("OS 拖动未命中滑块窗口")
     time.sleep(random.uniform(0.55, 0.95))
     mouse.up()
     debug_path = _dump_drag_event_debug(page, label=str(plan.get("label") or ""))
     if debug_path:
         plan["drag_event_debug"] = debug_path
     return distance
+
+
+def _capture_hold_screenshot(page: Any, *, image_dir: str = "images", label: str = "") -> Optional[str]:
+    try:
+        root = _find_captcha_root(page)
+        if root is None:
+            return None
+        out_dir = Path(image_dir) / "aliyun_probe"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"hold_state_{int(time.time() * 1000)}.png"
+        _screenshot_locator(root, str(path))
+        print(f"  🖼️ {label + ' ' if label else ''}松手前截图: {path}")
+        return str(path)
+    except Exception:
+        return None
 
 
 def _install_drag_event_debug(page: Any) -> None:
@@ -1969,6 +2318,83 @@ def _dump_drag_event_debug(page: Any, *, image_dir: str = "images", label: str =
         return str(path)
     except Exception:
         return None
+
+
+def _drag_has_down_event(page: Any) -> bool:
+    try:
+        events = page.evaluate("() => window.__captchaDragEvents || []") or []
+    except Exception:
+        return False
+    if not isinstance(events, list):
+        return False
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("kind")) in {"mousedown", "pointerdown"}:
+            target = str(event.get("target") or "")
+            if "aliyunCaptcha-sliding-slider" in target or "slider" in target.lower() or target:
+                return True
+    return False
+
+
+def _drag_events_out_of_bounds(
+    page: Any,
+    *,
+    start_x: float,
+    start_y: float,
+    max_distance: float,
+) -> Optional[str]:
+    """检测拖动中是否出现明显跑飞轨迹。
+
+    正常滑块拖动应始终围绕滑轨附近小幅上下抖动；真实日志中的失败样本出现过
+    x=1300+、y=-97/974 这类跳点，说明 OS 鼠标/窗口焦点/坐标映射已经异常。
+    这类尝试基本必失败，应该立即结束本次重试，而不是继续等待十几秒。
+    """
+    try:
+        events = page.evaluate("() => window.__captchaDragEvents || []") or []
+    except Exception:
+        return None
+    if not isinstance(events, list) or not events:
+        return None
+
+    min_x = float(start_x) - 40.0
+    max_x = float(start_x) + float(max_distance) + 90.0
+    min_y = float(start_y) - 180.0
+    max_y = float(start_y) + 180.0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if "move" not in str(event.get("kind", "")):
+            continue
+        try:
+            x = float(event.get("x", 0.0))
+            y = float(event.get("y", 0.0))
+        except Exception:
+            continue
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        if x < min_x or x > max_x or y < min_y or y > max_y:
+            return (
+                f"x={x:.1f}, y={y:.1f}, "
+                f"允许范围 x=[{min_x:.1f},{max_x:.1f}] y=[{min_y:.1f},{max_y:.1f}]"
+            )
+    return None
+
+
+def _motion_state_looks_focus_missed(state: dict[str, Any]) -> bool:
+    try:
+        slider_left = float(state.get("sliderLeft", 0.0))
+        puzzle_left = float(state.get("puzzleLeft", 0.0))
+        slider_box_x = float(state.get("sliderBoxX", 0.0))
+        puzzle_box_x = float(state.get("puzzleBoxX", 0.0))
+    except Exception:
+        return False
+    return (
+        abs(slider_left) <= 0.5
+        and abs(puzzle_left) <= 0.5
+        and abs(slider_box_x - puzzle_box_x) <= 0.5
+        and slider_box_x > 0
+    )
 
 
 def _load_manual_trace(path: str) -> Optional[dict[str, Any]]:
@@ -2125,8 +2551,44 @@ def _drag_aliyun_human_like(
         time.sleep(random.uniform(0.04, 0.09))
 
 
+ALIYUN_SUCCESS_PROFILE_POINTS: tuple[tuple[float, float, float], ...] = (
+    (0.1609, 0.3134, 0.0),
+    (0.1692, 0.5207, 2.0),
+    (0.1931, 0.6498, 2.0),
+    (0.2009, 0.7373, 0.0),
+    (0.2172, 0.7419, 0.0),
+    (0.2898, 0.8249, 0.0),
+    (0.3062, 0.8710, 0.0),
+    (0.3139, 0.8848, 1.0),
+    (0.3215, 0.8894, 0.0),
+    (0.4511, 0.9493, 1.0),
+    (0.4591, 0.9816, -1.0),
+    (0.4670, 1.0046, -3.0),
+    (0.4768, 1.0092, -1.0),
+    (0.6126, 0.9816, -1.0),
+    (0.6205, 0.9724, 0.0),
+    (0.6367, 0.9677, -2.0),
+    (0.6770, 1.0000, 1.0),
+    (0.6934, 1.0092, 1.0),
+    (0.7416, 0.9770, -1.0),
+    (0.7495, 0.9677, 1.0),
+    (0.7576, 0.9677, -1.0),
+    (0.8060, 0.9862, 0.0),
+    (0.8224, 1.0046, -1.0),
+    (0.8384, 1.0046, 1.0),
+    (0.8870, 0.9862, 1.0),
+    (0.8950, 0.9770, 0.0),
+    (0.9111, 0.9724, -1.0),
+    (0.9191, 0.9724, 1.0),
+    (0.9755, 0.9862, -1.0),
+    (0.9833, 0.9954, -1.0),
+    (0.9915, 1.0000, 1.0),
+    (1.0000, 1.0000, -1.0),
+)
+
+
 def _drag_aliyun_fast_three_stage(mouse: Any, start_x: float, start_y: float, distance: float) -> None:
-    """更接近 ai-captcha-bypass 的短三段拖动，减少长时间闭环/末端抖动特征。"""
+    """短三段快速拖动，避免长时间按住和末端闭环校准暴露自动化特征。"""
     part1 = distance * random.uniform(0.72, 0.80)
     part2 = distance * random.uniform(0.14, 0.22)
     part3 = distance - part1 - part2
@@ -2389,7 +2851,7 @@ def _calculate_aliyun_local_adjustment(page: Any, target_x: float) -> float:
     if puzzle_left is None or not math.isfinite(float(puzzle_left)):
         return 0.0
     visual_delta = float(target_x) - float(puzzle_left)
-    if abs(visual_delta) < 3.0:
+    if abs(visual_delta) < 0.8:
         return 0.0
     # 只做中小范围修正；真实 Aliyun 图上 20~80px 的末端偏差很常见，过早拒绝会导致
     # 拼图停在缺口左侧。再大的偏差往往意味着目标识别错误，避免越调越错。
@@ -2420,27 +2882,190 @@ def _apply_final_alignment(
     total_suggested = 0.0
     total_applied = 0.0
     current = float(distance)
-    for _attempt in range(3):
-        local_adjustment = _calculate_aliyun_local_adjustment(page, target_x)
+    steps: list[dict[str, float]] = []
+    for _attempt in range(6):
+        state = _get_aliyun_motion_state(page)
+        if not state:
+            local_adjustment = _calculate_aliyun_local_adjustment(page, target_x)
+        else:
+            if _motion_state_looks_focus_missed(state):
+                break
+            try:
+                puzzle_left = float(state.get("puzzleLeft", float("nan")))
+                slider_left = float(state.get("sliderLeft", float("nan")))
+                visual_delta = float(target_x) - puzzle_left
+            except Exception:
+                visual_delta = float("nan")
+                slider_left = float("nan")
+                puzzle_left = float("nan")
+            if not math.isfinite(visual_delta):
+                local_adjustment = 0.0
+            else:
+                steps.append({
+                    "target": float(target_x),
+                    "puzzleLeft": float(puzzle_left),
+                    "sliderLeft": float(slider_left) if math.isfinite(slider_left) else 0.0,
+                    "delta": float(visual_delta),
+                })
+                # 真实样本显示“略微在目标左侧”比“压线或过右”更稳定：
+                # 过右 1~4px 时经常失败，而 +1px 左右已有成功样本。
+                if _alignment_delta_is_acceptable(visual_delta):
+                    break
+                ratio = ALIYUN_PUZZLE_MOVE_RATIO
+                if math.isfinite(slider_left) and abs(slider_left) >= 5:
+                    measured = abs(float(puzzle_left)) / max(abs(float(slider_left)), 1.0)
+                    if 0.35 <= measured <= 1.4:
+                        ratio = measured
+                local_adjustment = (visual_delta - _alignment_release_bias()) / max(ratio, 0.25)
+                local_adjustment = max(-45.0, min(45.0, local_adjustment))
         if not local_adjustment:
             break
-        applied_adjustment = _dampen_local_adjustment(local_adjustment)
+        applied_adjustment = _dampen_local_adjustment(local_adjustment, fast_quadratic=False)
         new_distance = max(20.0, min(current + applied_adjustment, max_distance))
-        if abs(new_distance - current) < 1.0:
+        if abs(new_distance - current) < 0.5:
             break
-        _drag_segment(mouse, start_x, start_y, current, new_distance, steps=random.randint(6, 11))
+        _drag_segment(mouse, start_x, start_y, current, new_distance, steps=random.randint(3, 6), y_amplitude=1.1)
         current = new_distance
         total_suggested += float(local_adjustment)
         total_applied += float(applied_adjustment)
-        time.sleep(random.uniform(0.05, 0.12))
+        time.sleep(random.uniform(0.04, 0.09))
+    final_state = _get_aliyun_motion_state(page)
+    if final_state and not _motion_state_looks_focus_missed(final_state):
+        try:
+            final_delta = float(target_x) - float(final_state.get("puzzleLeft", float("nan")))
+            steps.append({
+                "target": float(target_x),
+                "puzzleLeft": float(final_state.get("puzzleLeft", 0.0)),
+                "sliderLeft": float(final_state.get("sliderLeft", 0.0)),
+                "delta": float(final_delta),
+            })
+        except Exception:
+            pass
+    if steps:
+        plan["alignment_steps"] = steps
     if total_suggested:
         plan["local_adjustment"] = total_suggested
         plan["applied_local_adjustment"] = total_applied
     return current
 
 
-def _dampen_local_adjustment(adjustment: float) -> float:
+def _apply_release_backoff_if_needed(
+    page: Any,
+    mouse: Any,
+    plan: dict[str, Any],
+    start_x: float,
+    start_y: float,
+    distance: float,
+    max_distance: float,
+    target_x: float,
+    state: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """释放鼠标前做一次保守回拉，避免 mouseup 时滑块状态向右结算。"""
+
+    if _motion_state_looks_focus_missed(state):
+        return distance, state
+    try:
+        puzzle_left = float(state.get("puzzleLeft", float("nan")))
+        delta = float(target_x) - puzzle_left
+    except Exception:
+        return distance, state
+    if not math.isfinite(delta):
+        return distance, state
+
+    min_delta = _alignment_release_min_delta()
+    if delta >= min_delta:
+        return distance, state
+
+    ratio = _release_backoff_puzzle_ratio()
+    backoff = math.ceil(max(0.0, min_delta - delta) / max(ratio, 0.4))
+    backoff = max(1.0, min(float(backoff), _release_backoff_max_px(), max(0.0, float(distance) - 20.0)))
+    if backoff <= 0:
+        return distance, state
+    new_distance = max(20.0, min(float(distance) - backoff, float(max_distance)))
+    if abs(new_distance - float(distance)) < 0.5:
+        return distance, state
+
+    _drag_segment(mouse, start_x, start_y, float(distance), new_distance, steps=3, y_amplitude=0.8)
+    time.sleep(random.uniform(0.05, 0.09))
+    new_state = _get_aliyun_motion_state(page) or state
+    plan["release_backoff"] = {
+        "before_delta": float(delta),
+        "min_delta": float(min_delta),
+        "backoff": float(backoff),
+        "from_distance": float(distance),
+        "to_distance": float(new_distance),
+    }
+    try:
+        new_delta = float(target_x) - float(new_state.get("puzzleLeft", float("nan")))
+        if math.isfinite(new_delta):
+            plan["release_backoff"]["after_delta"] = float(new_delta)
+    except Exception:
+        pass
+    return new_distance, new_state
+
+
+def _alignment_target_tolerance() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_ALIGNMENT_TOLERANCE", "1.5"))
+    except Exception:
+        value = 1.5
+    return max(0.5, min(value, 3.0))
+
+
+def _alignment_delta_is_acceptable(delta: float) -> bool:
+    try:
+        value = float(delta)
+    except Exception:
+        return False
+    if not math.isfinite(value):
+        return False
+    return -_alignment_right_tolerance() <= value <= _alignment_release_bias()
+
+
+def _alignment_release_bias() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_ALIGNMENT_RELEASE_BIAS", "2.5"))
+    except Exception:
+        value = 2.5
+    return max(0.5, min(value, 4.0))
+
+
+def _alignment_right_tolerance() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_ALIGNMENT_RIGHT_TOLERANCE", "2.0"))
+    except Exception:
+        value = 2.0
+    return max(0.0, min(value, 4.0))
+
+
+def _alignment_release_min_delta() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_ALIGNMENT_RELEASE_MIN_DELTA", "-10"))
+    except Exception:
+        value = -10.0
+    return max(-10.0, min(value, 3.0))
+
+
+def _release_backoff_puzzle_ratio() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_RELEASE_BACKOFF_PUZZLE_RATIO", "1.75"))
+    except Exception:
+        value = 1.75
+    return max(0.4, min(value, 3.0))
+
+
+def _release_backoff_max_px() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_RELEASE_BACKOFF_MAX_PX", "6"))
+    except Exception:
+        value = 6.0
+    return max(1.0, min(value, 10.0))
+
+
+def _dampen_local_adjustment(adjustment: float, *, fast_quadratic: bool = False) -> float:
     value = float(adjustment)
+    if fast_quadratic:
+        value *= 0.5
     if abs(value) <= 18.0:
         return value
     return value * 0.65

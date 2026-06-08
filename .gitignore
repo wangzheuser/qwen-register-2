@@ -27,3 +27,4 @@ test/*.log
 proxy.txt
 .slider-captcha.lock
 .tmp_captcha_js/
+logs/
