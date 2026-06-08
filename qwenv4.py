@@ -20,6 +20,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from dataclasses import dataclass, field
 from datetime import datetime
 import httpx
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -84,6 +85,48 @@ _ACCOUNT_SAVE_LOCKS_GUARD = threading.Lock()
 STOP_EVENT = threading.Event()
 INTERRUPT_COUNT = 0
 WORKER_START_INTERVAL_SECONDS = 0.1
+
+
+@dataclass
+class AccountRunResult:
+    """单个账号 worker 的执行结果。"""
+
+    success: bool
+    duration_seconds: float | None = None
+
+    def __bool__(self):
+        return self.success
+
+
+@dataclass
+class AccountRunSummary:
+    """账号批量执行汇总。"""
+
+    success_count: int = 0
+    success_durations: list[float] = field(default_factory=list)
+
+    def __eq__(self, other):
+        if isinstance(other, int):
+            return self.success_count == other
+        return super().__eq__(other)
+
+
+def format_success_rate(success_count, total_accounts):
+    if total_accounts <= 0:
+        return "0.00%"
+    return f"{(success_count / total_accounts) * 100:.2f}%"
+
+
+def format_average_success_duration(summary):
+    durations = list(getattr(summary, "success_durations", []) or [])
+    if not durations:
+        return "无成功账号"
+    average_seconds = sum(durations) / len(durations)
+    total_seconds = int(round(average_seconds))
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes:
+        return f"{minutes}分{seconds:02d}秒"
+    return f"{seconds}秒"
 START_STOP_FILE_ENV = "QWEN_REGISTER_STOP_FILE"
 START_MANAGED_ENV = "QWEN_REGISTER_MANAGED_BY_START"
 
@@ -525,7 +568,7 @@ def sleep_interruptible(seconds):
 
 def collect_account_futures(futures, total_accounts, poll_interval=0.5):
     """轮询收集账号任务结果，避免 Ctrl+C 后长期阻塞在 as_completed。"""
-    success_count = 0
+    summary = AccountRunSummary()
     pending = set(futures)
     while pending:
         if STOP_EVENT.is_set():
@@ -549,8 +592,12 @@ def collect_account_futures(futures, total_accounts, poll_interval=0.5):
         for future in done:
             index = futures[future]
             try:
-                if future.result():
-                    success_count += 1
+                result = future.result()
+                if result:
+                    summary.success_count += 1
+                    duration = getattr(result, "duration_seconds", None)
+                    if duration is not None:
+                        summary.success_durations.append(float(duration))
             except KeyboardInterrupt:
                 request_shutdown("收到 Ctrl+C")
                 for item in pending:
@@ -558,10 +605,10 @@ def collect_account_futures(futures, total_accounts, poll_interval=0.5):
                         item.cancel()
                     except Exception:
                         pass
-                return success_count
+                return summary
             except Exception as e:
                 print(f"  ❌ [账号 {index}/{total_accounts}] 任务异常: {e}")
-    return success_count
+    return summary
 
 
 def submit_account_futures(
@@ -1333,22 +1380,31 @@ def register_qwen(
 
 def run_single_account(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号编号；失败时可换新邮箱/浏览器代理补偿重试。"""
+    worker_started_at = time.perf_counter()
     max_attempts = max(1, int(getattr(args, "account_retries", 1) or 1))
     for attempt in range(1, max_attempts + 1):
         if STOP_EVENT.is_set():
-            return False
+            return AccountRunResult(False, time.perf_counter() - worker_started_at)
         if max_attempts > 1:
             print(f"\n🔁 [账号 {account_index}/{total_accounts}] 第 {attempt}/{max_attempts} 次尝试")
-        if _run_single_account_once(account_index, total_accounts, args, proxy_str):
-            return True
+        result = _run_single_account_once(account_index, total_accounts, args, proxy_str)
+        if result:
+            if isinstance(result, AccountRunResult):
+                return AccountRunResult(True, time.perf_counter() - worker_started_at)
+            return result
         if attempt < max_attempts and not STOP_EVENT.is_set():
             print(f"  🔁 [账号 {account_index}/{total_accounts}] 本次尝试失败，准备更换邮箱和浏览器代理重试...")
             sleep_interruptible(0.5)
-    return False
+    return AccountRunResult(False, time.perf_counter() - worker_started_at)
 
 
 def _run_single_account_once(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号注册任务；每个线程独立创建 Playwright 实例。"""
+    started_at = time.perf_counter()
+
+    def result(success):
+        return AccountRunResult(success=success, duration_seconds=time.perf_counter() - started_at)
+
     label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
     print(f"🔢 {label}")
@@ -1358,7 +1414,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
         proxy_info = build_browser_proxy(getattr(args, "browser_proxy", "") or proxy_str)
     except ValueError as e:
         print(f"  ❌ {label} {e}")
-        return False
+        return result(False)
     proxy_dict = proxy_info["proxy"]
     if proxy_dict:
         print(f"  🌐 {label} 浏览器代理: {proxy_info['display']}")
@@ -1372,11 +1428,11 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
     try:
         if STOP_EVENT.is_set():
             print(f"  🛑 {label} 已收到停止请求，跳过")
-            return False
+            return result(False)
         with sync_playwright() as p:
             if STOP_EVENT.is_set():
                 print(f"  🛑 {label} 已收到停止请求，跳过")
-                return False
+                return result(False)
             try:
                 with acquire_foreground_window_lock(label=f"{label} 浏览器启动", stop_event=STOP_EVENT):
                     browser = p.chromium.launch(
@@ -1386,7 +1442,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     )
             except Exception as e:
                 print(f"  ❌ {label} 浏览器启动失败: {e}")
-                return False
+                return result(False)
 
             try:
                 context = browser.new_context(
@@ -1434,7 +1490,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     install_aliyun_verify_success_route(qwen)
                 if STOP_EVENT.is_set():
                     print(f"  🛑 {label} 已收到停止请求，跳过注册")
-                    return False
+                    return result(False)
                 registered = register_qwen(
                     qwen,
                     name,
@@ -1446,7 +1502,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                 )
                 if not registered:
                     print(f"  ❌ {label} 注册失败，跳过...")
-                    return False
+                    return result(False)
 
                 verify_url = provider.get_activation_link(timeout=300)
 
@@ -1487,7 +1543,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                 )
 
                 print(f"  ✅ {label} 已验证并保存！")
-                return True
+                return result(True)
 
             except EmailProviderError as e:
                 print(f"  ❌ {label} 邮箱服务错误: {e}")
@@ -1513,7 +1569,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
     except Exception as e:
         print(f"  ❌ {label} 执行异常: {e}")
 
-    return False
+    return result(False)
 
 
 def main():
@@ -1537,7 +1593,7 @@ def main():
 
     args = parse_args()
     logging_state = enable_run_logging(args, script_stem="qwenv4")
-    success_count = 0
+    summary = AccountRunSummary()
     try:
         print(f"🧾 运行日志: {logging_state.path}")
         num_accounts = args.count
@@ -1598,7 +1654,7 @@ def main():
                 proxy_str=None,
             )
             try:
-                success_count = collect_account_futures(futures, num_accounts)
+                summary = collect_account_futures(futures, num_accounts)
             finally:
                 if STOP_EVENT.is_set():
                     for future in futures:
@@ -1607,7 +1663,11 @@ def main():
                     print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
 
         print(f"\n{'═'*60}")
+        success_count = summary.success_count
         print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")
+        print(f"📊 成功数: {success_count}/{num_accounts}")
+        print(f"📈 成功率: {format_success_rate(success_count, num_accounts)}")
+        print(f"⏱️ 平均成功耗时: {format_average_success_duration(summary)}")
         print("💾 结果保存到:")
         print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
         print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")

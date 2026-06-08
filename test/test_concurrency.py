@@ -492,6 +492,73 @@ def test_collect_futures_honors_stop_without_waiting_for_unfinished_future(monke
     assert pending.cancelled is True
 
 
+def test_collect_account_futures_summarizes_success_durations(monkeypatch):
+    class DoneFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    futures = {
+        DoneFuture(qwenv4.AccountRunResult(success=True, duration_seconds=10.0)): 1,
+        DoneFuture(qwenv4.AccountRunResult(success=False, duration_seconds=99.0)): 2,
+        DoneFuture(qwenv4.AccountRunResult(success=True, duration_seconds=20.0)): 3,
+    }
+    monkeypatch.setattr(qwenv4, "wait", lambda pending, timeout, return_when: (set(pending), set()))
+    qwenv4.STOP_EVENT.clear()
+
+    summary = qwenv4.collect_account_futures(futures, 3, poll_interval=0)
+
+    assert summary.success_count == 2
+    assert sorted(summary.success_durations) == [10.0, 20.0]
+    assert bool(qwenv4.AccountRunResult(success=True, duration_seconds=1.0)) is True
+    assert bool(qwenv4.AccountRunResult(success=False, duration_seconds=1.0)) is False
+
+
+def test_collect_account_futures_still_accepts_bool_results(monkeypatch):
+    class DoneFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    futures = {DoneFuture(True): 1, DoneFuture(False): 2, DoneFuture(True): 3}
+    monkeypatch.setattr(qwenv4, "wait", lambda pending, timeout, return_when: (set(pending), set()))
+    qwenv4.STOP_EVENT.clear()
+
+    summary = qwenv4.collect_account_futures(futures, 3, poll_interval=0)
+
+    assert summary.success_count == 2
+    assert summary.success_durations == []
+    assert summary == 2
+
+
+@pytest.mark.parametrize(
+    ("success_count", "total", "expected"),
+    [
+        (0, 10, "0.00%"),
+        (8, 10, "80.00%"),
+        (10, 10, "100.00%"),
+    ],
+)
+def test_format_success_rate(success_count, total, expected):
+    assert qwenv4.format_success_rate(success_count, total) == expected
+
+
+def test_format_average_success_duration_uses_only_success_durations():
+    summary = qwenv4.AccountRunSummary(success_count=2, success_durations=[61.0, 63.0])
+
+    assert qwenv4.format_average_success_duration(summary) == "1分02秒"
+
+
+def test_format_average_success_duration_handles_no_success():
+    summary = qwenv4.AccountRunSummary(success_count=0, success_durations=[])
+
+    assert qwenv4.format_average_success_duration(summary) == "无成功账号"
+
+
 
 def test_request_shutdown_forces_exit_after_short_grace(monkeypatch):
     exits = []

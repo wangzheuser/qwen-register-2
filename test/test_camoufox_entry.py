@@ -114,7 +114,10 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
     monkeypatch.setattr(qwenv4_camoufox, "maybe_sync_account_to_qwen2api", lambda **_kwargs: None)
     monkeypatch.setattr(qwenv4_camoufox.time, "sleep", lambda _seconds: None)
 
-    assert qwenv4_camoufox.run_single_account(1, 1, args, None) is True
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+    assert result.success is True
+    assert result.duration_seconds is not None
+    assert result.duration_seconds >= 0
 
     launch_kwargs = seen["launch_kwargs"]
     assert launch_kwargs["headless"] is False
@@ -149,7 +152,9 @@ def test_camoufox_worker_returns_false_when_browser_launch_fails(monkeypatch, ca
 
     monkeypatch.setattr(qwenv4_camoufox, "Camoufox", BrokenCamoufox)
 
-    assert qwenv4_camoufox.run_single_account(1, 1, args, None) is False
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+    assert result.success is False
+    assert result.duration_seconds is not None
     assert "python -m camoufox fetch" in capsys.readouterr().out
 
 
@@ -180,5 +185,7 @@ def test_camoufox_worker_returns_false_when_browser_enter_fails(monkeypatch, cap
 
     monkeypatch.setattr(qwenv4_camoufox, "Camoufox", BrokenEnterCamoufox)
 
-    assert qwenv4_camoufox.run_single_account(1, 1, args, None) is False
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+    assert result.success is False
+    assert result.duration_seconds is not None
     assert "python -m camoufox fetch" in capsys.readouterr().out

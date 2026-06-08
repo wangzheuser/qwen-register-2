@@ -19,6 +19,8 @@ from email_providers import EmailCreationError, EmailProviderError, EmailProvide
 from email_providers.generator_email import GeneratorEmailProvider
 from email_providers.store import UsedEmailsStore
 from qwenv4 import (
+    AccountRunResult,
+    AccountRunSummary,
     HEADLESS,
     IMAGES_DIR,
     OUTPUT_FILE_JSON,
@@ -37,6 +39,8 @@ from qwenv4 import (
     gen_name,
     gen_password,
     get_current_ip,
+    format_average_success_duration,
+    format_success_rate,
     install_aliyun_callback_probe,
     install_aliyun_verify_success_route,
     is_generator_provider,
@@ -69,6 +73,11 @@ def _camoufox_launch_kwargs(proxy_dict):
 
 def run_single_account(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号注册任务；每个线程独立创建 Camoufox 实例。"""
+    started_at = time.perf_counter()
+
+    def result(success):
+        return AccountRunResult(success=success, duration_seconds=time.perf_counter() - started_at)
+
     label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
     print(f"🦊 {label} Camoufox")
@@ -78,7 +87,7 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
         proxy_info = build_browser_proxy(getattr(args, "browser_proxy", "") or proxy_str)
     except ValueError as e:
         print(f"  ❌ {label} {e}")
-        return False
+        return result(False)
     proxy_dict = proxy_info["proxy"]
     if proxy_dict:
         print(f"  🌐 {label} 浏览器代理: {proxy_info['display']}")
@@ -93,14 +102,14 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
     try:
         if STOP_EVENT.is_set():
             print(f"  🛑 {label} 已收到停止请求，跳过")
-            return False
+            return result(False)
         try:
             with acquire_foreground_window_lock(label=f"{label} Camoufox 启动", stop_event=STOP_EVENT):
                 browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")
-            return False
+            return result(False)
 
         try:
             with browser_cm as browser:
@@ -145,7 +154,7 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                     install_aliyun_callback_probe(qwen)
                     if STOP_EVENT.is_set():
                         print(f"  🛑 {label} 已收到停止请求，跳过注册")
-                        return False
+                        return result(False)
                     registered = register_qwen(
                         qwen,
                         name,
@@ -157,7 +166,7 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                     )
                     if not registered:
                         print(f"  ❌ {label} 注册失败，跳过...")
-                        return False
+                        return result(False)
 
                     verify_url = provider.get_activation_link(timeout=300)
 
@@ -198,7 +207,7 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
                     )
 
                     print(f"  ✅ {label} 已验证并保存！")
-                    return True
+                    return result(True)
 
                 except EmailProviderError as e:
                     print(f"  ❌ {label} 邮箱服务错误: {e}")
@@ -224,11 +233,11 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")
-            return False
+            return result(False)
     except Exception as e:
         print(f"  ❌ {label} 执行异常: {e}")
 
-    return False
+    return result(False)
 
 
 def main():
@@ -295,7 +304,7 @@ def main():
             print("🔁 qwen2API 同步: 未启用")
         print("🔒 严格模式: 已启用（不会自动降级）\n")
 
-        success_count = 0
+        summary = AccountRunSummary()
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             futures = submit_account_futures(
                 executor,
@@ -305,7 +314,7 @@ def main():
                 proxy_str=None,
             )
             try:
-                success_count = collect_account_futures(futures, num_accounts)
+                summary = collect_account_futures(futures, num_accounts)
             finally:
                 if STOP_EVENT.is_set():
                     for future in futures:
@@ -314,7 +323,11 @@ def main():
                     print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
 
         print(f"\n{'═'*60}")
+        success_count = summary.success_count
         print(f"🎉 完成: 已创建 {success_count}/{num_accounts} 个账号")
+        print(f"📊 成功数: {success_count}/{num_accounts}")
+        print(f"📈 成功率: {format_success_rate(success_count, num_accounts)}")
+        print(f"⏱️ 平均成功耗时: {format_average_success_duration(summary)}")
         print("💾 结果保存到:")
         print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
         print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
