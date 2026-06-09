@@ -383,7 +383,7 @@ def test_workers_guard_foreground_sensitive_launch_and_new_page():
     import qwenv4_camoufox
 
     normal_source = inspect.getsource(qwenv4._run_single_account_once)
-    camoufox_source = inspect.getsource(qwenv4_camoufox.run_single_account)
+    camoufox_source = inspect.getsource(qwenv4_camoufox._run_single_account_once)
 
     assert "acquire_foreground_window_lock(label=f\"{label} 浏览器启动\"" in normal_source
     assert "acquire_foreground_window_lock(label=f\"{label} 新建注册页\"" in normal_source

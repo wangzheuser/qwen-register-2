@@ -22,7 +22,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
 import httpx
-from captcha_solvers.window_focus import ensure_page_topmost_foreground
+from captcha_solvers.window_focus import ensure_page_topmost_foreground, get_page_window_rect
 try:  # pragma: no cover - 依赖缺失时运行时会自动降级到 AI 估算。
     from PIL import Image
 except Exception:  # pragma: no cover
@@ -2847,8 +2847,10 @@ def _get_viewport_screen_metrics(page: Any) -> Optional[dict[str, float]]:
               const borderX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
               const topChrome = Math.max(0, window.outerHeight - window.innerHeight - borderX);
               return {
-                offsetX: window.screenX + borderX,
-                offsetY: window.screenY + topChrome,
+                screenX: window.screenX,
+                screenY: window.screenY,
+                borderX,
+                topChrome,
                 scaleX: scale,
                 scaleY: scale,
                 outerWidth: window.outerWidth,
@@ -2865,9 +2867,36 @@ def _get_viewport_screen_metrics(page: Any) -> Optional[dict[str, float]]:
         inner_height = float(metrics.get("innerHeight", 0))
         if inner_width <= 100 or inner_height <= 100:
             return None
+        outer_width = float(metrics.get("outerWidth") or 0.0)
+        outer_height = float(metrics.get("outerHeight") or 0.0)
+        border_x = float(metrics.get("borderX") if metrics.get("borderX") is not None else max(0.0, (outer_width - inner_width) / 2.0))
+        top_chrome = float(
+            metrics.get("topChrome")
+            if metrics.get("topChrome") is not None
+            else max(0.0, outer_height - inner_height - border_x)
+        )
+        offset_x = float(metrics.get("screenX") or 0.0) + border_x
+        offset_y = float(metrics.get("screenY") or 0.0) + top_chrome
+
+        hwnd_rect = get_page_window_rect(page)
+        if hwnd_rect:
+            try:
+                rect_width = float(hwnd_rect["right"] - hwnd_rect["left"])
+                rect_height = float(hwnd_rect["bottom"] - hwnd_rect["top"])
+                if (
+                    rect_width >= inner_width
+                    and rect_height >= inner_height
+                    and (outer_width <= 0 or abs(rect_width - outer_width) <= 180)
+                    and (outer_height <= 0 or abs(rect_height - outer_height) <= 180)
+                ):
+                    offset_x = float(hwnd_rect["left"]) + border_x
+                    offset_y = float(hwnd_rect["top"]) + top_chrome
+            except Exception:
+                pass
+
         return {
-            "offsetX": float(metrics["offsetX"]),
-            "offsetY": float(metrics["offsetY"]),
+            "offsetX": float(offset_x),
+            "offsetY": float(offset_y),
             "scaleX": float(metrics.get("scaleX") or 1.0),
             "scaleY": float(metrics.get("scaleY") or 1.0),
         }

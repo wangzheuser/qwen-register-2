@@ -2183,6 +2183,36 @@ def test_perform_drag_os_backend_aborts_when_down_event_misses_page(monkeypatch)
         })
 
 
+def test_viewport_screen_metrics_prefers_real_hwnd_rect_over_dom_screen(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    class Page:
+        def evaluate(self, _script):
+            return {
+                # Camoufox/Firefox 指纹层可能让 window.screenX/Y 与真实窗口位置不一致。
+                "offsetX": 1020,
+                "offsetY": 840,
+                "outerWidth": 1280,
+                "outerHeight": 800,
+                "innerWidth": 1240,
+                "innerHeight": 720,
+            }
+
+    monkeypatch.setattr(
+        ai_slider,
+        "get_page_window_rect",
+        lambda _page: {"left": 40, "top": 70, "right": 1320, "bottom": 870},
+        raising=False,
+    )
+
+    metrics = ai_slider._get_viewport_screen_metrics(Page())
+
+    assert metrics is not None
+    # borderX=(1280-1240)/2=20; topChrome=800-720-20=60
+    assert metrics["offsetX"] == pytest.approx(60)
+    assert metrics["offsetY"] == pytest.approx(130)
+
+
 def test_drag_events_out_of_bounds_detects_mouse_jump():
     from captcha_solvers.ai_slider import _drag_events_out_of_bounds
 

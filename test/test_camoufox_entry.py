@@ -158,6 +158,39 @@ def test_camoufox_worker_returns_false_when_browser_launch_fails(monkeypatch, ca
     assert "python -m camoufox fetch" in capsys.readouterr().out
 
 
+def test_camoufox_worker_retries_failed_attempts(monkeypatch, capsys):
+    import qwenv4_camoufox
+
+    launch_attempts = {"count": 0}
+
+    class BrokenCamoufox:
+        def __init__(self, **kwargs):
+            launch_attempts["count"] += 1
+            raise RuntimeError("camoufox missing")
+
+    args = types.SimpleNamespace(
+        email_provider="mailtm",
+        verbose=False,
+        api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
+        captcha_timeout=600,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1:7860",
+        qwen2api_admin_key="admin",
+        qwen2api_timeout=30,
+        account_retries=2,
+    )
+
+    monkeypatch.setattr(qwenv4_camoufox, "Camoufox", BrokenCamoufox)
+    monkeypatch.setattr(qwenv4_camoufox, "sleep_interruptible", lambda _seconds: True)
+
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+
+    assert result.success is False
+    assert launch_attempts["count"] == 2
+    assert "第 2/2 次尝试" in capsys.readouterr().out
+
+
 def test_camoufox_worker_returns_false_when_browser_enter_fails(monkeypatch, capsys):
     import qwenv4_camoufox
 

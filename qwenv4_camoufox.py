@@ -48,6 +48,7 @@ from qwenv4 import (
     positive_int,
     register_qwen,
     save_account,
+    sleep_interruptible,
     start_parent_stop_file_watcher,
     submit_account_futures,
     wait_for_token_extraction,
@@ -71,7 +72,7 @@ def _camoufox_launch_kwargs(proxy_dict):
     return kwargs
 
 
-def run_single_account(account_index, total_accounts, args, proxy_str=None):
+def _run_single_account_once(account_index, total_accounts, args, proxy_str=None):
     """执行单个账号注册任务；每个线程独立创建 Camoufox 实例。"""
     started_at = time.perf_counter()
 
@@ -241,6 +242,26 @@ def run_single_account(account_index, total_accounts, args, proxy_str=None):
         print(f"  ❌ {label} 执行异常: {e}")
 
     return result(False)
+
+
+def run_single_account(account_index, total_accounts, args, proxy_str=None):
+    """执行单个账号编号；失败时可换新邮箱/浏览器代理补偿重试。"""
+    worker_started_at = time.perf_counter()
+    max_attempts = max(1, int(getattr(args, "account_retries", 1) or 1))
+    for attempt in range(1, max_attempts + 1):
+        if STOP_EVENT.is_set():
+            return AccountRunResult(False, time.perf_counter() - worker_started_at)
+        if max_attempts > 1:
+            print(f"\n🔁 [账号 {account_index}/{total_accounts}] 第 {attempt}/{max_attempts} 次尝试")
+        result = _run_single_account_once(account_index, total_accounts, args, proxy_str)
+        if result:
+            if isinstance(result, AccountRunResult):
+                return AccountRunResult(True, time.perf_counter() - worker_started_at)
+            return result
+        if attempt < max_attempts and not STOP_EVENT.is_set():
+            print(f"  🔁 [账号 {account_index}/{total_accounts}] 本次尝试失败，准备更换邮箱和浏览器代理重试...")
+            sleep_interruptible(0.5)
+    return AccountRunResult(False, time.perf_counter() - worker_started_at)
 
 
 def main():

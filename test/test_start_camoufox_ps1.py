@@ -90,7 +90,7 @@ def test_start_camoufox_ps1_uses_defaults_and_saves_separate_config(tmp_path):
 
     assert_success(result)
     command = without_log_arg(result.stdout)
-    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --captcha-solver ddddocr --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in command
+    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --account-retries 3 --captcha-solver ddddocr --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in command
     assert "--captcha-timeout" not in command
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved == expected_defaults()
@@ -102,11 +102,11 @@ def test_start_camoufox_ps1_saves_and_reuses_values(tmp_path):
 
     first = run_start("3\n2\nhttp://127.0.0.1:7890\nhttp://baokemeng.{uuid}:testpass@127.0.0.1:9200\ny\n2\n\ny\nhttp://127.0.0.1:9999\nsecret\n45\n\n", config_path)
     assert_success(first)
-    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --browser-proxy http://baokemeng.{uuid}:testpass@127.0.0.1:9200 --concurrency 2 --captcha-solver ddddocr --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in without_log_arg(first.stdout)
+    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --browser-proxy http://baokemeng.{uuid}:testpass@127.0.0.1:9200 --concurrency 2 --account-retries 3 --captcha-solver ddddocr --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in without_log_arg(first.stdout)
 
     second = run_start("\n\n\n\n\n\n\n\n\n\n\n", config_path)
     assert_success(second)
-    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --browser-proxy http://baokemeng.{uuid}:testpass@127.0.0.1:9200 --concurrency 2 --captcha-solver ddddocr --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in without_log_arg(second.stdout)
+    assert "qwenv4_camoufox.py 3 --email-provider mailtm --api-proxy http://127.0.0.1:7890 --browser-proxy http://baokemeng.{uuid}:testpass@127.0.0.1:9200 --concurrency 2 --account-retries 3 --captcha-solver ddddocr --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --sync-qwen2api --qwen2api-base-url http://127.0.0.1:9999 --qwen2api-admin-key secret --qwen2api-timeout 45 --verbose --strict" in without_log_arg(second.stdout)
 
 
 def test_start_camoufox_ps1_executes_camoufox_entry_and_streams_output(tmp_path):
@@ -193,7 +193,7 @@ def test_start_script_ai_mode_saves_timeout_and_uses_key(tmp_path):
 
     assert_success(result)
     command = without_log_arg(result.stdout)
-    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --captcha-solver ai --captcha-timeout 123 --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in command
+    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --account-retries 3 --captcha-solver ai --captcha-timeout 123 --captcha-ai-attempts 3 --no-captcha-ai-fallback-manual --captcha-drag-backend os --captcha-drag-strategy fast_quadratic --strict" in command
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["captcha_solver"] == "ai"
     assert saved["captcha_timeout"] == 123
@@ -205,7 +205,7 @@ def test_start_script_manual_mode_uses_timeout(tmp_path):
 
     assert_success(result)
     command = without_log_arg(result.stdout)
-    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --captcha-solver manual --captcha-timeout 456 --strict" in command
+    assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --account-retries 3 --captcha-solver manual --captcha-timeout 456 --strict" in command
     assert "--captcha-ai-attempts" not in command
 
 

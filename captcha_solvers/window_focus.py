@@ -242,6 +242,38 @@ def minimize_page_window(page: Any, *, label: str = "") -> bool:
         _restore_page_focus_marker_after_minimize(page)
 
 
+def get_page_window_rect(page: Any, *, marker_prefix: str = "qwen-rect") -> Optional[dict[str, int]]:
+    """返回页面所属顶层浏览器窗口的 Win32 矩形。
+
+    Camoufox/Firefox 的 ``window.screenX/Y`` 可能受到指纹层影响，不能总是
+    作为真实 OS 鼠标坐标换算依据。这里通过标题 marker 定位 HWND，并读取
+    Windows 真实窗口矩形，供 OS 鼠标拖动链路使用。
+    """
+    if os.name != "nt":
+        return None
+    marker = f"{marker_prefix}-{uuid.uuid4().hex}"
+    try:
+        _set_page_focus_marker(page, marker)
+        _wait_for_title_marker(page, marker, timeout=0.5)
+        hwnd = _find_hwnd_for_page(page, marker, allow_metrics_fallback=True)
+        if not hwnd:
+            return None
+        rect = _get_hwnd_rect(int(hwnd))
+        if not rect:
+            return None
+        return {
+            "left": int(rect[0]),
+            "top": int(rect[1]),
+            "right": int(rect[2]),
+            "bottom": int(rect[3]),
+            "hwnd": int(hwnd),
+        }
+    except Exception:
+        return None
+    finally:
+        _restore_page_focus_marker(page)
+
+
 def _restore_page_focus_marker_after_minimize(page: Any) -> None:
     try:
         page.evaluate(
@@ -363,6 +395,7 @@ def _configure_user32_api(user32: Any) -> None:
         "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
         "GetWindowTextLengthW": ([wintypes.HWND], ctypes.c_int),
         "GetWindowTextW": ([wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int),
+        "GetWindowRect": ([wintypes.HWND, ctypes.c_void_p], wintypes.BOOL),
         "EnumWindows": ([ctypes.c_void_p, wintypes.LPARAM], wintypes.BOOL),
     }
     for name, (argtypes, restype) in prototypes.items():
@@ -500,6 +533,29 @@ def _find_hwnd_by_window_metrics(metrics: dict[str, float]) -> Optional[int]:
         # 多个窗口位置/尺寸几乎相同，说明 metrics fallback 无法唯一定位页面。
         return None
     return candidates[0][1]
+
+
+def _get_hwnd_rect(hwnd: int) -> Optional[tuple[int, int, int, int]]:
+    if os.name != "nt" or not hwnd:
+        return None
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    try:
+        rect = RECT()
+        if not _get_user32().GetWindowRect(int(hwnd), ctypes.byref(rect)):
+            return None
+        if rect.right - rect.left < 100 or rect.bottom - rect.top < 100:
+            return None
+        return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+    except Exception:
+        return None
 
 
 def _set_hwnd_topmost(hwnd: int) -> bool:

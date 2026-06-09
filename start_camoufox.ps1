@@ -643,7 +643,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($browserProxy)) {
         $scriptArgs += @("--browser-proxy", $browserProxy)
     }
-    $scriptArgs += @("--concurrency", [string]$concurrency)
+    $scriptArgs += @("--concurrency", [string]$concurrency, "--account-retries", "3")
     if ($captchaSolver -eq "ddddocr") {
         $scriptArgs += @("--captcha-solver", "ddddocr", "--captcha-ai-attempts", "3", "--no-captcha-ai-fallback-manual", "--captcha-drag-backend", "os", "--captcha-drag-strategy", "fast_quadratic")
     } elseif ($captchaSolver -eq "ai") {
