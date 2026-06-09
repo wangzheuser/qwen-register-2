@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 from camoufox.sync_api import Camoufox
@@ -57,6 +59,23 @@ from qwenv4 import (
 
 CAMOUFOX_WINDOW = (1280, 800)
 CAMOUFOX_VIEWPORT = {"width": 1280, "height": 800}
+CAMOUFOX_RUNTIME_LOCK = threading.RLock()
+
+
+@contextmanager
+def acquire_camoufox_runtime_lock(label):
+    """串行化 Camoufox Sync API 调用，避免多线程 asyncio loop/driver 互相阻塞。"""
+    started = time.perf_counter()
+    print(f"  ⏳ {label} 等待 Camoufox 运行时锁...")
+    CAMOUFOX_RUNTIME_LOCK.acquire()
+    print(f"  🔐 {label} 已获得 Camoufox 运行时锁 waited={time.perf_counter() - started:.3f}s")
+    held_started = time.perf_counter()
+    try:
+        yield
+    finally:
+        held = time.perf_counter() - held_started
+        CAMOUFOX_RUNTIME_LOCK.release()
+        print(f"  🔓 {label} 释放 Camoufox 运行时锁 held={held:.3f}s")
 
 
 def _camoufox_launch_kwargs(proxy_dict):
@@ -104,62 +123,66 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
         if STOP_EVENT.is_set():
             print(f"  🛑 {label} 已收到停止请求，跳过")
             return result(False)
+        browser_cm = None
         try:
-            with acquire_foreground_window_lock(label=f"{label} Camoufox 启动", stop_event=STOP_EVENT):
-                browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
+            with acquire_camoufox_runtime_lock(f"{label} Camoufox 启动"):
+                with acquire_foreground_window_lock(label=f"{label} Camoufox 启动", stop_event=STOP_EVENT):
+                    browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
+                    browser = browser_cm.__enter__()
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")
             return result(False)
 
         try:
-            with browser_cm as browser:
-                try:
-                    context = browser.new_context(viewport=CAMOUFOX_VIEWPORT)
-
-                    if getattr(args, "browser_proxy", "") or proxy_str:
-                        current_ip, country = "unknown", "unknown"
-                        print(f"  📡 {label} 已配置浏览器代理，跳过本机 IP 检测")
-                    else:
-                        current_ip, country = get_current_ip()
-                        print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
-
-                    provider = EmailProviderFactory.create(
-                        provider_type=args.email_provider,
-                        verbose=args.verbose,
-                        api_proxy=args.api_proxy,
-                        context=context,
-                    )
-
-                    used_emails_store = UsedEmailsStore("used_emails.json")
-                    max_email_retries = 1 if isinstance(provider, GeneratorEmailProvider) else 3
-                    email = None
-                    for _attempt in range(max_email_retries):
-                        candidate = provider.create_inbox()
-                        if used_emails_store.claim(candidate):
-                            email = candidate
-                            break
-                        print(f"  ⚠️ {label} 邮箱已使用: {candidate}")
-                        if isinstance(provider, GeneratorEmailProvider):
-                            break
-
-                    if not email:
-                        raise EmailCreationError("多次创建邮箱均重复，跳过当前账号")
-
-                    first_name = gen_first_name()
-                    password = gen_password()
-                    name = gen_name(first_name)
-
-                    print(f"  📧 {label} 邮箱:    {email}")
-                    print(f"  👤 {label} 用户名:  {name}")
-                    print(f"  🔑 {label} 密码:    {password}")
-
+            try:
+                with acquire_camoufox_runtime_lock(f"{label} 新建注册页"):
                     with acquire_foreground_window_lock(label=f"{label} 新建注册页", stop_event=STOP_EVENT):
-                        qwen = context.new_page()
+                        qwen = browser.new_page(viewport=CAMOUFOX_VIEWPORT)
+                    context = qwen.context
                     install_aliyun_callback_probe(qwen)
-                    if STOP_EVENT.is_set():
-                        print(f"  🛑 {label} 已收到停止请求，跳过注册")
-                        return result(False)
+
+                if getattr(args, "browser_proxy", "") or proxy_str:
+                    current_ip, country = "unknown", "unknown"
+                    print(f"  📡 {label} 已配置浏览器代理，跳过本机 IP 检测")
+                else:
+                    current_ip, country = get_current_ip()
+                    print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
+
+                provider = EmailProviderFactory.create(
+                    provider_type=args.email_provider,
+                    verbose=args.verbose,
+                    api_proxy=args.api_proxy,
+                    context=context,
+                )
+
+                used_emails_store = UsedEmailsStore("used_emails.json")
+                max_email_retries = 1 if isinstance(provider, GeneratorEmailProvider) else 3
+                email = None
+                for _attempt in range(max_email_retries):
+                    candidate = provider.create_inbox()
+                    if used_emails_store.claim(candidate):
+                        email = candidate
+                        break
+                    print(f"  ⚠️ {label} 邮箱已使用: {candidate}")
+                    if isinstance(provider, GeneratorEmailProvider):
+                        break
+
+                if not email:
+                    raise EmailCreationError("多次创建邮箱均重复，跳过当前账号")
+
+                first_name = gen_first_name()
+                password = gen_password()
+                name = gen_name(first_name)
+
+                print(f"  📧 {label} 邮箱:    {email}")
+                print(f"  👤 {label} 用户名:  {name}")
+                print(f"  🔑 {label} 密码:    {password}")
+
+                if STOP_EVENT.is_set():
+                    print(f"  🛑 {label} 已收到停止请求，跳过注册")
+                    return result(False)
+                with acquire_camoufox_runtime_lock(f"{label} 注册流程"):
                     registered = register_qwen(
                         qwen,
                         name,
@@ -169,12 +192,13 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                         captcha_solver_config=build_captcha_solver_config(args),
                         label=label,
                     )
-                    if not registered:
-                        print(f"  ❌ {label} 注册失败，跳过...")
-                        return result(False)
+                if not registered:
+                    print(f"  ❌ {label} 注册失败，跳过...")
+                    return result(False)
 
-                    verify_url = provider.get_activation_link(timeout=300)
+                verify_url = provider.get_activation_link(timeout=300)
 
+                with acquire_camoufox_runtime_lock(f"{label} 验证与令牌提取"):
                     print(f"  🔄 {label} 正在打开验证链接...")
                     qwen.goto(verify_url, wait_until="domcontentloaded", timeout=30000)
 
@@ -189,51 +213,59 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                         print(f"  ⚠️  {label} 未找到认证令牌（可能需要等待更久）")
 
                     body = qwen.evaluate("document.body.innerText") or ""
-                    print(f"  📋 {label} 验证结果: {body[:200]}")
+                print(f"  📋 {label} 验证结果: {body[:200]}")
 
-                    save_account(
-                        email=email,
-                        password=password,
-                        name=name,
-                        ip=current_ip,
-                        country=country,
-                        token=tokens.get("token"),
-                        active_token=tokens.get("active_token"),
-                        device_id=tokens.get("device_id"),
-                        user_role=tokens.get("user_role", "user"),
-                    )
-                    maybe_sync_account_to_qwen2api(
-                        email=email,
-                        password=password,
-                        token=tokens.get("token"),
-                        config=build_qwen2api_sync_config(args),
-                        label=label,
-                    )
+                save_account(
+                    email=email,
+                    password=password,
+                    name=name,
+                    ip=current_ip,
+                    country=country,
+                    token=tokens.get("token"),
+                    active_token=tokens.get("active_token"),
+                    device_id=tokens.get("device_id"),
+                    user_role=tokens.get("user_role", "user"),
+                )
+                maybe_sync_account_to_qwen2api(
+                    email=email,
+                    password=password,
+                    token=tokens.get("token"),
+                    config=build_qwen2api_sync_config(args),
+                    label=label,
+                )
 
-                    print(f"  ✅ {label} 已验证并保存！")
-                    return result(True)
+                print(f"  ✅ {label} 已验证并保存！")
+                return result(True)
 
-                except EmailProviderError as e:
-                    print(f"  ❌ {label} 邮箱服务错误: {e}")
-                    print(f"  ⏭️ {label} 严格模式：跳过当前账号，不自动降级")
-                except Exception as e:
-                    print(f"  ❌ {label} 出错: {e}")
-                finally:
-                    if qwen is not None:
-                        try:
+            except EmailProviderError as e:
+                print(f"  ❌ {label} 邮箱服务错误: {e}")
+                print(f"  ⏭️ {label} 严格模式：跳过当前账号，不自动降级")
+            except Exception as e:
+                print(f"  ❌ {label} 出错: {e}")
+            finally:
+                if qwen is not None:
+                    try:
+                        with acquire_camoufox_runtime_lock(f"{label} 关闭注册页"):
                             qwen.close()
-                        except Exception:
-                            pass
-                    if provider is not None:
-                        try:
-                            provider.cleanup()
-                        except Exception:
-                            pass
-                    if context is not None:
-                        try:
+                    except Exception:
+                        pass
+                if provider is not None:
+                    try:
+                        provider.cleanup()
+                    except Exception:
+                        pass
+                if context is not None:
+                    try:
+                        with acquire_camoufox_runtime_lock(f"{label} 关闭浏览器上下文"):
                             context.close()
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
+                if browser_cm is not None:
+                    try:
+                        with acquire_camoufox_runtime_lock(f"{label} 关闭 Camoufox"):
+                            browser_cm.__exit__(None, None, None)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")

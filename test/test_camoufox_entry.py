@@ -1,4 +1,5 @@
 import types
+from contextlib import contextmanager
 
 import pytest
 
@@ -22,6 +23,9 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
     seen = {}
 
     class DummyPage:
+        def __init__(self, context=None):
+            self.context = context
+
         def goto(self, *args, **kwargs):
             pass
 
@@ -35,26 +39,16 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
             pass
 
     class DummyContext:
-        def __init__(self):
-            self.pages = []
-
-        def new_page(self):
-            page = DummyPage()
-            self.pages.append(page)
-            return page
-
         def close(self):
             pass
 
     class DummyBrowser:
         def __init__(self):
-            self.contexts = []
+            self.context = DummyContext()
 
-        def new_context(self, **kwargs):
-            seen["context_kwargs"] = kwargs
-            context = DummyContext()
-            self.contexts.append(context)
-            return context
+        def new_page(self, **kwargs):
+            seen["page_kwargs"] = kwargs
+            return DummyPage(self.context)
 
         def close(self):
             pass
@@ -127,9 +121,8 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
     assert launch_kwargs["os"] == "windows"
     assert "--disable-blink-features=AutomationControlled" not in launch_kwargs.get("args", [])
     assert "--no-sandbox" not in launch_kwargs.get("args", [])
-    assert "user_agent" not in seen["context_kwargs"]
-    assert seen["context_kwargs"]["viewport"] == {"width": 1280, "height": 800}
-
+    assert "user_agent" not in seen["page_kwargs"]
+    assert seen["page_kwargs"]["viewport"] == {"width": 1280, "height": 800}
 
 def test_camoufox_worker_returns_false_when_browser_launch_fails(monkeypatch, capsys):
     import qwenv4_camoufox
@@ -222,3 +215,288 @@ def test_camoufox_worker_returns_false_when_browser_enter_fails(monkeypatch, cap
     assert result.success is False
     assert result.duration_seconds is not None
     assert "python -m camoufox fetch" in capsys.readouterr().out
+
+
+def test_camoufox_browser_enter_runs_inside_foreground_lock(monkeypatch, tmp_path):
+    import qwenv4_camoufox
+
+    lock_state = {"active": False, "enter_inside_lock": False}
+
+    @contextmanager
+    def fake_foreground_lock(**_kwargs):
+        lock_state["active"] = True
+        try:
+            yield
+        finally:
+            lock_state["active"] = False
+
+    class DummyPage:
+        def __init__(self, context=None):
+            self.context = context
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def screenshot(self, *args, **kwargs):
+            pass
+
+        def evaluate(self, *args, **kwargs):
+            return "验证完成"
+
+        def close(self):
+            pass
+
+    class DummyContext:
+        def close(self):
+            pass
+
+    class DummyBrowser:
+        def __init__(self):
+            self.context = DummyContext()
+
+        def new_page(self, **kwargs):
+            return DummyPage(self.context)
+
+    class DummyCamoufox:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            lock_state["enter_inside_lock"] = lock_state["active"]
+            return DummyBrowser()
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyProvider:
+        def create_inbox(self):
+            return "user@example.com"
+
+        def get_activation_link(self, timeout=300):
+            return "https://studio.qwen.ai/auth/verify?token=test"
+
+        def cleanup(self):
+            pass
+
+    args = types.SimpleNamespace(
+        email_provider="mailtm",
+        verbose=False,
+        api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
+        captcha_timeout=600,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1:7860",
+        qwen2api_admin_key="admin",
+        qwen2api_timeout=30,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwenv4_camoufox, "acquire_foreground_window_lock", fake_foreground_lock)
+    monkeypatch.setattr(qwenv4_camoufox, "Camoufox", DummyCamoufox)
+    monkeypatch.setattr(qwenv4_camoufox.EmailProviderFactory, "create", lambda **_kwargs: DummyProvider())
+    monkeypatch.setattr(qwenv4_camoufox.UsedEmailsStore, "claim", lambda self, email: True)
+    monkeypatch.setattr(qwenv4_camoufox, "register_qwen", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_token_extraction", lambda _page, timeout=5.0: {
+        "token": "token-1",
+        "active_token": None,
+        "device_id": None,
+        "user_role": "user",
+    })
+    monkeypatch.setattr(qwenv4_camoufox, "save_account", lambda **_kwargs: None)
+    monkeypatch.setattr(qwenv4_camoufox, "maybe_sync_account_to_qwen2api", lambda **_kwargs: None)
+
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+
+    assert result.success is True
+    assert lock_state["enter_inside_lock"] is True
+
+def test_camoufox_worker_runs_browser_api_inside_runtime_lock(monkeypatch, tmp_path):
+    import qwenv4_camoufox
+
+    lock_state = {
+        "runtime_active": False,
+        "enter_inside_runtime": False,
+        "new_page_inside_runtime": False,
+        "register_inside_runtime": False,
+    }
+
+    @contextmanager
+    def fake_runtime_lock(label):
+        lock_state["runtime_active"] = True
+        try:
+            yield
+        finally:
+            lock_state["runtime_active"] = False
+
+    class DummyPage:
+        def __init__(self, context=None):
+            self.context = context
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def screenshot(self, *args, **kwargs):
+            pass
+
+        def evaluate(self, *args, **kwargs):
+            return "验证完成"
+
+        def close(self):
+            pass
+
+    class DummyContext:
+        def close(self):
+            pass
+
+    class DummyBrowser:
+        def __init__(self):
+            self.context = DummyContext()
+
+        def new_page(self, **kwargs):
+            lock_state["new_page_inside_runtime"] = lock_state["runtime_active"]
+            return DummyPage(self.context)
+
+    class DummyCamoufox:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            lock_state["enter_inside_runtime"] = lock_state["runtime_active"]
+            return DummyBrowser()
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyProvider:
+        def create_inbox(self):
+            return "user@example.com"
+
+        def get_activation_link(self, timeout=300):
+            return "https://studio.qwen.ai/auth/verify?token=test"
+
+        def cleanup(self):
+            pass
+
+    def fake_register(*args, **kwargs):
+        lock_state["register_inside_runtime"] = lock_state["runtime_active"]
+        return True
+
+    args = types.SimpleNamespace(
+        email_provider="mailtm",
+        verbose=False,
+        api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
+        captcha_timeout=600,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1:7860",
+        qwen2api_admin_key="admin",
+        qwen2api_timeout=30,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwenv4_camoufox, "acquire_camoufox_runtime_lock", fake_runtime_lock, raising=False)
+    monkeypatch.setattr(qwenv4_camoufox, "Camoufox", DummyCamoufox)
+    monkeypatch.setattr(qwenv4_camoufox.EmailProviderFactory, "create", lambda **_kwargs: DummyProvider())
+    monkeypatch.setattr(qwenv4_camoufox.UsedEmailsStore, "claim", lambda self, email: True)
+    monkeypatch.setattr(qwenv4_camoufox, "register_qwen", fake_register)
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_token_extraction", lambda _page, timeout=5.0: {
+        "token": "token-1",
+        "active_token": None,
+        "device_id": None,
+        "user_role": "user",
+    })
+    monkeypatch.setattr(qwenv4_camoufox, "save_account", lambda **_kwargs: None)
+    monkeypatch.setattr(qwenv4_camoufox, "maybe_sync_account_to_qwen2api", lambda **_kwargs: None)
+
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+
+    assert result.success is True
+    assert lock_state["enter_inside_runtime"] is True
+    assert lock_state["new_page_inside_runtime"] is True
+    assert lock_state["register_inside_runtime"] is True
+
+def test_camoufox_worker_creates_registration_page_via_browser_new_page(monkeypatch, tmp_path):
+    import qwenv4_camoufox
+
+    seen = {"browser_new_page": False, "browser_new_context": False}
+
+    class DummyPage:
+        def __init__(self, context):
+            self.context = context
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def screenshot(self, *args, **kwargs):
+            pass
+
+        def evaluate(self, *args, **kwargs):
+            return "验证完成"
+
+        def close(self):
+            pass
+
+    class DummyContext:
+        def close(self):
+            pass
+
+    class DummyBrowser:
+        def new_context(self, **kwargs):
+            seen["browser_new_context"] = True
+            raise AssertionError("Camoufox worker should avoid browser.new_context().new_page()")
+
+        def new_page(self, **kwargs):
+            seen["browser_new_page"] = kwargs
+            return DummyPage(DummyContext())
+
+    class DummyCamoufox:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return DummyBrowser()
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyProvider:
+        def create_inbox(self):
+            return "user@example.com"
+
+        def get_activation_link(self, timeout=300):
+            return "https://studio.qwen.ai/auth/verify?token=test"
+
+        def cleanup(self):
+            pass
+
+    args = types.SimpleNamespace(
+        email_provider="mailtm",
+        verbose=False,
+        api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
+        captcha_timeout=600,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1:7860",
+        qwen2api_admin_key="admin",
+        qwen2api_timeout=30,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwenv4_camoufox, "Camoufox", DummyCamoufox)
+    monkeypatch.setattr(qwenv4_camoufox.EmailProviderFactory, "create", lambda **_kwargs: DummyProvider())
+    monkeypatch.setattr(qwenv4_camoufox.UsedEmailsStore, "claim", lambda self, email: True)
+    monkeypatch.setattr(qwenv4_camoufox, "register_qwen", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_token_extraction", lambda _page, timeout=5.0: {
+        "token": "token-1",
+        "active_token": None,
+        "device_id": None,
+        "user_role": "user",
+    })
+    monkeypatch.setattr(qwenv4_camoufox, "save_account", lambda **_kwargs: None)
+    monkeypatch.setattr(qwenv4_camoufox, "maybe_sync_account_to_qwen2api", lambda **_kwargs: None)
+
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+
+    assert result.success is True
+    assert seen["browser_new_context"] is False
+    assert seen["browser_new_page"] == {"viewport": {"width": 1280, "height": 800}}
