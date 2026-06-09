@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     portalocker = None  # type: ignore
 
 from captcha_solvers.slider_lock import SliderLockTimeout, acquire_foreground_window_lock, acquire_slider_lock
-from captcha_solvers.window_focus import ensure_page_foreground
+from captcha_solvers.window_focus import ensure_page_foreground, hold_page_topmost, minimize_page_window
 from captcha_solvers.ai_slider import (
     DEFAULT_CAPTCHA_AI_ATTEMPTS,
     DEFAULT_CAPTCHA_AI_BASE_URL,
@@ -73,6 +73,27 @@ BROWSER_ARGS = [
     '--no-sandbox',
     '--disable-dev-shm-usage',
 ]
+BROWSER_WINDOW_WIDTH = 1280
+BROWSER_WINDOW_HEIGHT = 800
+BROWSER_WINDOW_POSITION_BASE_X = 20
+BROWSER_WINDOW_POSITION_BASE_Y = 20
+BROWSER_WINDOW_POSITION_STEP_X = 55
+BROWSER_WINDOW_POSITION_STEP_Y = 35
+
+
+def build_browser_launch_args(account_index=1):
+    """构造 Chromium 启动参数；每个账号使用不同窗口位置，降低 HWND 定位歧义。"""
+    try:
+        slot = (max(1, int(account_index)) - 1) % 10
+    except Exception:
+        slot = 0
+    x = BROWSER_WINDOW_POSITION_BASE_X + slot * BROWSER_WINDOW_POSITION_STEP_X
+    y = BROWSER_WINDOW_POSITION_BASE_Y + slot * BROWSER_WINDOW_POSITION_STEP_Y
+    return [
+        *BROWSER_ARGS,
+        f"--window-size={BROWSER_WINDOW_WIDTH},{BROWSER_WINDOW_HEIGHT}",
+        f"--window-position={x},{y}",
+    ]
 
 USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -1299,90 +1320,94 @@ def register_qwen(
             label_prefix = f"{label} " if label else ""
             try:
                 with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
-                    if not focus_page_for_slider(page, label=label):
-                        return False
+                    try:
+                        with hold_page_topmost(page, label=label) as topmost_ok:
+                            if not topmost_ok:
+                                return False
+                            if not focus_page_for_slider(page, label=label):
+                                return False
 
-                    if not detect_captcha(page):
-                        print(f"  ✅ {label_prefix}验证码已在等待期间完成")
-                    else:
-                        manual_trace_records = None
-                        if captcha_solver_config is not None and captcha_solver_config.enabled:
-                            solver_result = solve_slider_captcha(
-                                page,
-                                captcha_solver_config,
-                                label=label,
-                                image_dir=IMAGES_DIR,
-                                stop_event=STOP_EVENT,
-                            )
-                            if solver_result.ok:
-                                print(f"  ✅ {label_prefix}{solver_result.message}")
-                                wait_for_registration_submission(page, timeout=3.0)
-                            elif captcha_solver_config.fallback_manual:
-                                print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
-                                manual_trace_records = attach_manual_trace_recorder(
-                                    page,
-                                    label=label,
-                                    image_dir=IMAGES_DIR,
-                                )
-                                captcha_completed = wait_for_captcha_completion(
-                                    page,
-                                    email,
-                                    password,
-                                    name,
-                                    timeout=captcha_timeout,
-                                )
-                                if not captcha_completed:
+                            if not detect_captcha(page):
+                                print(f"  ✅ {label_prefix}验证码已在等待期间完成")
+                            else:
+                                manual_trace_records = None
+                                if captcha_solver_config is not None and captcha_solver_config.enabled:
+                                    solver_result = solve_slider_captcha(
+                                        page,
+                                        captcha_solver_config,
+                                        label=label,
+                                        image_dir=IMAGES_DIR,
+                                        stop_event=STOP_EVENT,
+                                    )
+                                    if solver_result.ok:
+                                        print(f"  ✅ {label_prefix}{solver_result.message}")
+                                        wait_for_registration_submission(page, timeout=3.0)
+                                    elif captcha_solver_config.fallback_manual:
+                                        print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
+                                        manual_trace_records = attach_manual_trace_recorder(
+                                            page,
+                                            label=label,
+                                            image_dir=IMAGES_DIR,
+                                        )
+                                        captcha_completed = wait_for_captcha_completion(
+                                            page,
+                                            email,
+                                            password,
+                                            name,
+                                            timeout=captcha_timeout,
+                                        )
+                                        if not captcha_completed:
+                                            dump_manual_trace_recording(
+                                                page,
+                                                manual_trace_records,
+                                                label=label,
+                                                image_dir=IMAGES_DIR,
+                                            )
+                                            print("  ❌ 验证码未完成或超时")
+                                            return False
+                                        dump_manual_trace_recording(
+                                            page,
+                                            manual_trace_records,
+                                            label=label,
+                                            image_dir=IMAGES_DIR,
+                                        )
+                                        wait_for_registration_submission(page, timeout=3.0)
+                                    else:
+                                        print(f"  ❌ {label_prefix}{solver_result.message}")
+                                        return False
+                                else:
+                                    manual_trace_records = attach_manual_trace_recorder(
+                                        page,
+                                        label=label,
+                                        image_dir=IMAGES_DIR,
+                                    )
+                                    captcha_completed = wait_for_captcha_completion(
+                                        page,
+                                        email,
+                                        password,
+                                        name,
+                                        timeout=captcha_timeout,
+                                    )
+
+                                    if not captcha_completed:
+                                        dump_manual_trace_recording(
+                                            page,
+                                            manual_trace_records,
+                                            label=label,
+                                            image_dir=IMAGES_DIR,
+                                        )
+                                        print("  ❌ 验证码未完成或超时")
+                                        return False
                                     dump_manual_trace_recording(
                                         page,
                                         manual_trace_records,
                                         label=label,
                                         image_dir=IMAGES_DIR,
                                     )
-                                    print("  ❌ 验证码未完成或超时")
-                                    return False
-                                dump_manual_trace_recording(
-                                    page,
-                                    manual_trace_records,
-                                    label=label,
-                                    image_dir=IMAGES_DIR,
-                                )
-                                wait_for_registration_submission(page, timeout=3.0)
-                            else:
-                                print(f"  ❌ {label_prefix}{solver_result.message}")
-                                return False
-                        else:
-                            manual_trace_records = attach_manual_trace_recorder(
-                                page,
-                                label=label,
-                                image_dir=IMAGES_DIR,
-                            )
-                            # 等待用户手动完成验证码
-                            captcha_completed = wait_for_captcha_completion(
-                                page,
-                                email,
-                                password,
-                                name,
-                                timeout=captcha_timeout,
-                            )
-
-                            if not captcha_completed:
-                                dump_manual_trace_recording(
-                                    page,
-                                    manual_trace_records,
-                                    label=label,
-                                    image_dir=IMAGES_DIR,
-                                )
-                                print("  ❌ 验证码未完成或超时")
-                                return False
-
-                            # 验证码完成后，等待页面跳转
-                            dump_manual_trace_recording(
-                                page,
-                                manual_trace_records,
-                                label=label,
-                                image_dir=IMAGES_DIR,
-                            )
-                            wait_for_registration_submission(page, timeout=3.0)
+                                    wait_for_registration_submission(page, timeout=3.0)
+                    finally:
+                        print(f"  🪟 {label_prefix}滑块阶段结束，正在最小化窗口", flush=True)
+                        minimize_page_window(page, label=label)
             except SliderLockTimeout as e:
                 print(f"  🛑 {label_prefix}{e}")
                 return False
@@ -1493,7 +1518,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                 with acquire_foreground_window_lock(label=f"{label} 浏览器启动", stop_event=STOP_EVENT):
                     browser = p.chromium.launch(
                         headless=HEADLESS,
-                        args=BROWSER_ARGS,
+                        args=build_browser_launch_args(account_index),
                         proxy=proxy_dict,
                     )
             except Exception as e:

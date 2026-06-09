@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_SLIDER_LOCK_PATH = Path(".slider-captcha.lock")
+DEFAULT_SLIDER_FILE_LOCK_TIMEOUT = 20.0
 
 
 class SliderLockTimeout(RuntimeError):
@@ -158,6 +159,7 @@ def acquire_slider_lock(
     stop_event: Optional[object] = None,
     lock_path: str | Path = DEFAULT_SLIDER_LOCK_PATH,
     poll_interval: float = 0.2,
+    file_lock_timeout: float = DEFAULT_SLIDER_FILE_LOCK_TIMEOUT,
 ) -> Iterator[None]:
     """串行化完整滑块处理流程，保护 OS 鼠标、焦点和验证码状态。"""
     request = _COORDINATOR.acquire(
@@ -167,20 +169,38 @@ def acquire_slider_lock(
         poll_interval=poll_interval,
     )
     file_lock = None
+    file_lock_acquired = False
     try:
         if portalocker is not None:
             file_lock = portalocker.Lock(str(lock_path), timeout=0)
+            wait_started = time.monotonic()
+            last_wait_log = wait_started
             while True:
                 if _cancelled(stop_event):
                     raise SliderLockTimeout("等待前台焦点文件锁 type=slider 时收到停止请求")
                 try:
                     file_lock.acquire()
+                    file_lock_acquired = True
                     break
                 except portalocker.exceptions.LockException:
+                    elapsed = time.monotonic() - wait_started
+                    if elapsed >= file_lock_timeout:
+                        raise SliderLockTimeout(
+                            f"等待前台焦点文件锁 type=slider 超时 "
+                            f"({elapsed:.1f}s/{file_lock_timeout:.1f}s)"
+                        )
+                    now = time.monotonic()
+                    if now - last_wait_log >= 5.0:
+                        print(
+                            f"  ⏳ {label + ' ' if label else ''}等待前台焦点文件锁 "
+                            f"type=slider elapsed={elapsed:.1f}s...",
+                            flush=True,
+                        )
+                        last_wait_log = now
                     time.sleep(poll_interval)
         yield
     finally:
-        if file_lock is not None:
+        if file_lock is not None and file_lock_acquired:
             try:
                 file_lock.release()
             except Exception:

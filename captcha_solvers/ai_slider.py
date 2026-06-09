@@ -22,7 +22,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
 import httpx
-from captcha_solvers.window_focus import ensure_page_foreground
+from captcha_solvers.window_focus import ensure_page_topmost_foreground
 try:  # pragma: no cover - 依赖缺失时运行时会自动降级到 AI 估算。
     from PIL import Image
 except Exception:  # pragma: no cover
@@ -231,7 +231,7 @@ def solve_slider_captcha(
                 and os.getenv("CAPTCHA_DRAG_BACKEND", "playwright").strip().lower() == "os"
                 and hasattr(page, "bring_to_front")
                 and hasattr(page, "evaluate")
-                and not ensure_page_foreground(page, label=label, attempts=2, delay=0.2)
+                and not ensure_page_topmost_foreground(page, label=label, attempts=2, delay=0.2)
             ):
                 last_message = "OS 前台焦点确认失败"
                 print(f"  ⚠️ {prefix}{last_message}，重新聚焦后重试")
@@ -374,7 +374,12 @@ def solve_slider_captcha(
             if _is_cancelled(stop_event):
                 return CaptchaSolverResult(ok=False, message="AI 滑块处理已取消", attempts=attempt - 1)
 
-            actual_distance = _perform_drag(page, drag_plan)
+            actual_distance = _perform_drag_with_focus_retry(
+                page,
+                drag_plan,
+                prefix=prefix,
+                stop_event=stop_event,
+            )
             last_distance = int(round(actual_distance))
             adjustment = drag_plan.get("local_adjustment")
             if adjustment:
@@ -493,6 +498,50 @@ def solve_slider_captcha(
         distance=last_distance,
         screenshot_path=last_screenshot,
     )
+
+
+def _is_focus_miss_drag_exception(exc: Exception, plan: dict[str, Any]) -> bool:
+    if bool(plan.get("focus_missed")):
+        return True
+    message = str(exc)
+    return any(
+        text in message
+        for text in (
+            "未命中滑块窗口",
+            "前台焦点确认失败",
+            "放弃按下滑块",
+        )
+    )
+
+
+def _perform_drag_with_focus_retry(
+    page: Any,
+    plan: dict[str, Any],
+    *,
+    prefix: str = "",
+    stop_event: Optional[Any] = None,
+) -> float:
+    """执行拖动；OS 焦点抖动时不消耗验证码识别次数，短重聚焦再试一次。"""
+    last_exc: Optional[Exception] = None
+    for retry_index in range(2):
+        try:
+            return _perform_drag(page, plan)
+        except Exception as exc:
+            last_exc = exc
+            if retry_index > 0 or not _is_focus_miss_drag_exception(exc, plan) or _is_cancelled(stop_event):
+                raise
+            plan["focus_retry_count"] = int(plan.get("focus_retry_count") or 0) + 1
+            plan.pop("focus_missed", None)
+            label = str(plan.get("label") or "").strip()
+            print(
+                f"  🔁 {prefix}OS 鼠标未命中滑块窗口，正在重新激活窗口并重试本次拖动",
+                flush=True,
+            )
+            ensure_page_topmost_foreground(page, label=label, attempts=3, delay=0.2)
+            time.sleep(0.2)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("滑块拖动未执行")
 
 
 
@@ -2052,13 +2101,13 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
     use_probe_calibration = plan.get("source") == "ddddocr" and calibrate_target_x is not None
     distance = max(20.0, min(distance, max_distance))
 
-    if uses_os_mouse and not ensure_page_foreground(page, label=str(plan.get("label") or ""), attempts=2, delay=0.15):
+    if uses_os_mouse and not ensure_page_topmost_foreground(page, label=str(plan.get("label") or ""), attempts=2, delay=0.15):
         plan["focus_missed"] = True
         raise RuntimeError("OS 前台焦点确认失败，放弃拖动")
 
     _mouse_move(mouse, start_x, start_y, steps=3)
     time.sleep(random.uniform(0.22, 0.42))
-    if uses_os_mouse and not ensure_page_foreground(page, label=str(plan.get("label") or ""), attempts=1, delay=0.1):
+    if uses_os_mouse and not ensure_page_topmost_foreground(page, label=str(plan.get("label") or ""), attempts=1, delay=0.1):
         plan["focus_missed"] = True
         raise RuntimeError("OS 前台焦点确认失败，放弃按下滑块")
     mouse.down()

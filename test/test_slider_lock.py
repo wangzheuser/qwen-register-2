@@ -2,6 +2,7 @@
 import threading
 import time
 
+import portalocker
 import pytest
 
 from captcha_solvers.slider_lock import (
@@ -239,4 +240,23 @@ def test_acquire_foreground_lock_is_window_lock_alias(tmp_path):
                 entered.append("window")
 
     assert entered == []
+
+
+def test_slider_file_lock_timeout_releases_foreground_coordinator(tmp_path):
+    """跨进程文件锁被占用时，不能一直持有进程内前台锁。"""
+    lock_path = tmp_path / "held-by-other-process.lock"
+
+    with portalocker.Lock(str(lock_path), timeout=0):
+        with pytest.raises(SliderLockTimeout):
+            with acquire_slider_lock(
+                "[滑块]",
+                lock_path=lock_path,
+                poll_interval=0.005,
+                file_lock_timeout=0.03,
+            ):
+                pytest.fail("文件锁被占用时不应进入滑块临界区")
+
+    # 如果上面的异常没有释放 coordinator，这里会卡住或被取消。
+    with acquire_foreground_window_lock("[窗口]", lock_path=lock_path, poll_interval=0.005):
+        assert True
 

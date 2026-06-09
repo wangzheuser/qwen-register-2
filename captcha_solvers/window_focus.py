@@ -8,14 +8,17 @@ Playwright 的 ``page.bring_to_front()`` 和页面内 ``document.hasFocus()``
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 
 SW_RESTORE = 9
+SW_MINIMIZE = 6
 GA_ROOT = 2
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
@@ -46,8 +49,95 @@ def ensure_page_foreground(
     或 Win32 调用失败时，回退为 Playwright/DOM 焦点确认。
     """
 
+    return _ensure_page_foreground(
+        page,
+        label=label,
+        attempts=attempts,
+        delay=delay,
+        keep_topmost=False,
+        marker_prefix="qwen-slider",
+    )
+
+
+def ensure_page_topmost_foreground(
+    page: Any,
+    *,
+    label: str = "",
+    attempts: int = 3,
+    delay: float = 0.25,
+) -> bool:
+    """确认页面位于 Windows 前台，并保持顶层浏览器窗口置顶。"""
+    return _ensure_page_foreground(
+        page,
+        label=label,
+        attempts=attempts,
+        delay=delay,
+        keep_topmost=True,
+        marker_prefix="qwen-topmost",
+    )
+
+
+@contextmanager
+def hold_page_topmost(page: Any, *, label: str = "") -> Iterator[bool]:
+    """滑块阶段置顶租约：进入时强制置顶，退出时取消置顶。"""
     prefix = f"{label} " if label else ""
-    marker = f"qwen-slider-{uuid.uuid4().hex}"
+    hwnd: Optional[int] = None
+
+    if os.name != "nt":
+        _try_playwright_focus(page)
+        ok = _dom_focus_ok(page)
+        if ok:
+            print(f"  ✅ {prefix}滑块窗口前台置顶确认成功（非 Windows 降级）", flush=True)
+        else:
+            print(f"  ❌ {prefix}滑块窗口前台置顶确认失败（非 Windows 降级）", flush=True)
+        yield ok
+        return
+
+    marker = f"qwen-topmost-hold-{uuid.uuid4().hex}"
+    try:
+        _try_playwright_focus(page)
+        _set_page_focus_marker(page, marker)
+        _wait_for_title_marker(page, marker, timeout=0.8)
+        hwnd = _find_hwnd_for_page(page, marker, allow_metrics_fallback=True)
+        if not hwnd:
+            print(f"  ❌ {prefix}滑块窗口前台置顶确认失败：未找到浏览器窗口", flush=True)
+            yield False
+            return
+
+        _activate_hwnd(int(hwnd), keep_topmost=True)
+        time.sleep(0.2)
+        ok = _foreground_matches(int(hwnd))
+        if ok:
+            print(f"  ✅ {prefix}滑块窗口已强制置顶 hwnd={int(hwnd)}", flush=True)
+            print(f"  ✅ {prefix}滑块窗口前台置顶确认成功", flush=True)
+        else:
+            print(
+                f"  ❌ {prefix}滑块窗口前台置顶确认失败 "
+                f"hwnd={int(hwnd)} foreground={_get_foreground_hwnd()}",
+                flush=True,
+            )
+        yield ok
+    finally:
+        if hwnd:
+            print(f"  🪟 {prefix}滑块阶段结束，正在取消置顶", flush=True)
+            if _clear_hwnd_topmost(int(hwnd)):
+                print(f"  ✅ {prefix}滑块窗口置顶已取消", flush=True)
+            else:
+                print(f"  ⚠️ {prefix}滑块窗口置顶取消失败/跳过", flush=True)
+        _restore_page_focus_marker(page)
+
+
+def _ensure_page_foreground(
+    page: Any,
+    *,
+    label: str,
+    attempts: int,
+    delay: float,
+    keep_topmost: bool,
+    marker_prefix: str,
+) -> bool:
+    prefix = f"{label} " if label else ""
+    marker = f"{marker_prefix}-{uuid.uuid4().hex}"
     _try_playwright_focus(page)
     marker_set = _set_page_focus_marker(page, marker)
 
@@ -63,9 +153,9 @@ def ensure_page_foreground(
                 last_result = ForegroundFocusResult(ok=False, message="DOM 焦点确认失败")
             else:
                 _wait_for_title_marker(page, marker, timeout=0.8)
-                hwnd = _find_hwnd_for_page(page, marker)
+                hwnd = _find_hwnd_for_page(page, marker, allow_metrics_fallback=True)
                 if hwnd:
-                    _activate_hwnd(hwnd)
+                    _activate_hwnd(hwnd, keep_topmost=keep_topmost)
                     time.sleep(min(max(delay, 0.0), 0.3))
                     foreground_hwnd = _get_foreground_hwnd()
                     ok = _foreground_matches(hwnd)
@@ -73,14 +163,27 @@ def ensure_page_foreground(
                         ok=ok,
                         hwnd=int(hwnd),
                         foreground_hwnd=foreground_hwnd,
-                        message="OS 前台窗口匹配" if ok else "OS 前台窗口不匹配",
+                        message=(
+                            "OS 前台置顶窗口匹配"
+                            if ok and keep_topmost
+                            else "OS 前台窗口匹配"
+                            if ok
+                            else "OS 前台窗口不匹配"
+                        ),
                     )
                     if ok:
                         return True
                 else:
                     if not marker_set and _dom_focus_ok(page):
                         return True
-                    last_result = ForegroundFocusResult(ok=False, message="未找到带滑块标记的浏览器窗口")
+                    last_result = ForegroundFocusResult(
+                        ok=False,
+                        message=(
+                            "未找到带滑块标记且可唯一匹配的浏览器窗口"
+                            if keep_topmost
+                            else "未找到带滑块标记的浏览器窗口"
+                        ),
+                    )
 
             if attempt < total_attempts:
                 print(
@@ -98,6 +201,62 @@ def ensure_page_foreground(
         return False
     finally:
         _restore_page_focus_marker(page)
+
+
+def minimize_page_window(page: Any, *, label: str = "") -> bool:
+    """最小化 Playwright 页面对应的顶层浏览器窗口。
+
+    该函数用于滑块阶段结束后释放 Windows 前台资源。它不会调用
+    ``page.bring_to_front()``，避免在释放焦点前再次抢占前台。
+    """
+    prefix = f"{label} " if label else ""
+    if os.name != "nt":
+        print(f"  ⚠️ {prefix}滑块窗口最小化跳过：非 Windows 环境", flush=True)
+        return False
+
+    marker = f"qwen-minimize-{uuid.uuid4().hex}"
+    try:
+        _set_page_focus_marker(page, marker)
+        _wait_for_title_marker(page, marker, timeout=0.5)
+        hwnd = _find_hwnd_for_page(page, marker, allow_metrics_fallback=True)
+        if not hwnd:
+            print(f"  ⚠️ {prefix}滑块窗口最小化失败/跳过：未找到浏览器窗口", flush=True)
+            return False
+
+        try:
+            _clear_hwnd_topmost(int(hwnd))
+            ok = bool(_get_user32().ShowWindow(int(hwnd), SW_MINIMIZE))
+        except Exception as exc:
+            print(f"  ⚠️ {prefix}滑块窗口最小化失败/跳过: {exc}", flush=True)
+            return False
+
+        if ok:
+            print(f"  ✅ {prefix}滑块窗口已最小化", flush=True)
+            return True
+        print(f"  ⚠️ {prefix}滑块窗口最小化失败/跳过：ShowWindow 返回失败", flush=True)
+        return False
+    except Exception as exc:
+        print(f"  ⚠️ {prefix}滑块窗口最小化失败/跳过: {exc}", flush=True)
+        return False
+    finally:
+        _restore_page_focus_marker_after_minimize(page)
+
+
+def _restore_page_focus_marker_after_minimize(page: Any) -> None:
+    try:
+        page.evaluate(
+            """
+            () => {
+              if (window.__qwenSliderOriginalTitle !== undefined) {
+                document.title = window.__qwenSliderOriginalTitle || '';
+                delete window["__qwenSliderFocusMarker"];
+                delete window["__qwenSliderOriginalTitle"];
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
 
 
 def _try_playwright_focus(page: Any) -> None:
@@ -173,7 +332,46 @@ def _dom_focus_ok(page: Any) -> bool:
 
 
 def _get_user32() -> Any:
-    return ctypes.windll.user32
+    user32 = ctypes.windll.user32
+    _configure_user32_api(user32)
+    return user32
+
+
+def _configure_user32_api(user32: Any) -> None:
+    """为常用 Win32 API 配置 ctypes 原型，避免 64 位 HWND 被当作 c_int 传参。
+
+    如果未声明 ``argtypes``，ctypes 会按 C ``int`` 处理 Python 整数参数。
+    这会导致 ``SetWindowPos(hwnd, HWND_NOTOPMOST, ...)`` 在 64 位 Windows 上
+    偶发返回 ``ERROR_INVALID_WINDOW_HANDLE(1400)``，表现为滑块结束后取消置顶
+    失败。对真实 WinDLL 配置原型；测试中的轻量 fake 不支持属性设置时直接跳过。
+    """
+
+    prototypes = {
+        "SetWindowPos": (
+            [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint],
+            wintypes.BOOL,
+        ),
+        "ShowWindow": ([wintypes.HWND, ctypes.c_int], wintypes.BOOL),
+        "BringWindowToTop": ([wintypes.HWND], wintypes.BOOL),
+        "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
+        "GetForegroundWindow": ([], wintypes.HWND),
+        "GetAncestor": ([wintypes.HWND, ctypes.c_uint], wintypes.HWND),
+        "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.c_void_p], wintypes.DWORD),
+        "AttachThreadInput": ([wintypes.DWORD, wintypes.DWORD, wintypes.BOOL], wintypes.BOOL),
+        "SetActiveWindow": ([wintypes.HWND], wintypes.HWND),
+        "SetFocus": ([wintypes.HWND], wintypes.HWND),
+        "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
+        "GetWindowTextLengthW": ([wintypes.HWND], ctypes.c_int),
+        "GetWindowTextW": ([wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int),
+        "EnumWindows": ([ctypes.c_void_p, wintypes.LPARAM], wintypes.BOOL),
+    }
+    for name, (argtypes, restype) in prototypes.items():
+        try:
+            func = getattr(user32, name)
+            func.argtypes = argtypes
+            func.restype = restype
+        except Exception:
+            pass
 
 
 def _find_hwnd_by_title_marker(marker: str) -> Optional[int]:
@@ -205,10 +403,12 @@ def _find_hwnd_by_title_marker(marker: str) -> Optional[int]:
     return found[0] if found else None
 
 
-def _find_hwnd_for_page(page: Any, marker: str) -> Optional[int]:
+def _find_hwnd_for_page(page: Any, marker: str, *, allow_metrics_fallback: bool = True) -> Optional[int]:
     hwnd = _find_hwnd_by_title_marker(marker)
     if hwnd:
         return hwnd
+    if not allow_metrics_fallback:
+        return None
     metrics = _get_page_window_metrics(page)
     if not metrics:
         return None
@@ -295,10 +495,73 @@ def _find_hwnd_by_window_metrics(metrics: dict[str, float]) -> Optional[int]:
     user32.EnumWindows(enum_proc_type(callback), 0)
     if not candidates:
         return None
-    return min(candidates, key=lambda item: item[0])[1]
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > 1 and abs(candidates[1][0] - candidates[0][0]) <= 20.0:
+        # 多个窗口位置/尺寸几乎相同，说明 metrics fallback 无法唯一定位页面。
+        return None
+    return candidates[0][1]
 
 
-def _activate_hwnd(hwnd: int) -> bool:
+def _set_hwnd_topmost(hwnd: int) -> bool:
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        return bool(_get_user32().SetWindowPos(
+            int(hwnd),
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        ))
+    except Exception:
+        return False
+
+
+def _clear_hwnd_topmost(hwnd: int) -> bool:
+    if os.name != "nt" or not hwnd:
+        return False
+    flags = SWP_NOMOVE | SWP_NOSIZE
+    if _set_window_pos(int(hwnd), HWND_NOTOPMOST, flags):
+        return True
+    # 某些窗口在恢复/激活状态变化中会拒绝第一次 NOTOPMOST；加 SHOWWINDOW 再试一次。
+    return _set_window_pos(int(hwnd), HWND_NOTOPMOST, flags | SWP_SHOWWINDOW)
+
+
+def _set_window_pos(hwnd: int, insert_after: int, flags: int) -> bool:
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        _reset_last_error()
+        return bool(_get_user32().SetWindowPos(
+            int(hwnd),
+            int(insert_after),
+            0,
+            0,
+            0,
+            0,
+            int(flags),
+        ))
+    except Exception:
+        return False
+
+
+def _last_error() -> int:
+    try:
+        return int(ctypes.windll.kernel32.GetLastError())
+    except Exception:
+        return 0
+
+
+def _reset_last_error() -> None:
+    try:
+        ctypes.windll.kernel32.SetLastError(0)
+    except Exception:
+        pass
+
+
+def _activate_hwnd(hwnd: int, *, keep_topmost: bool = False) -> bool:
     if os.name != "nt" or not hwnd:
         return False
     user32 = _get_user32()
@@ -307,11 +570,8 @@ def _activate_hwnd(hwnd: int) -> bool:
         user32.ShowWindow(hwnd, SW_RESTORE)
     except Exception:
         pass
-    try:
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-    except Exception:
-        pass
+    if keep_topmost:
+        _set_hwnd_topmost(int(hwnd))
     try:
         user32.BringWindowToTop(hwnd)
     except Exception:

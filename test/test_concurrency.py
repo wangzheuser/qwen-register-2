@@ -24,6 +24,20 @@ def test_parse_args_accepts_log_file_path():
     assert args.log_file == "logs/custom.log"
 
 
+def test_build_browser_launch_args_assigns_unique_window_positions():
+    first = qwenv4.build_browser_launch_args(1)
+    second = qwenv4.build_browser_launch_args(2)
+    tenth = qwenv4.build_browser_launch_args(10)
+
+    assert "--window-size=1280,800" in first
+    assert "--window-size=1280,800" in second
+    first_position = next(arg for arg in first if arg.startswith("--window-position="))
+    second_position = next(arg for arg in second if arg.startswith("--window-position="))
+    tenth_position = next(arg for arg in tenth if arg.startswith("--window-position="))
+    assert first_position != second_position
+    assert len({first_position, second_position, tenth_position}) == 3
+
+
 def test_enable_run_logging_writes_stdout_and_stderr_to_file(tmp_path):
     import sys
     from types import SimpleNamespace
@@ -261,8 +275,17 @@ def test_register_qwen_passes_captcha_timeout(monkeypatch):
             return "待激活"
 
     seen = {}
+
+    class FakeTopmost:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     monkeypatch.setattr(qwenv4.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
 
     def fake_wait_for_captcha_completion(page, email, password, name, timeout=300):
         seen["timeout"] = timeout
