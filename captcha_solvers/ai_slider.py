@@ -186,8 +186,13 @@ def solve_slider_captcha(
     last_target_signature: Optional[tuple[Optional[float], Optional[float], Optional[float], str]] = None
     repeated_target_index = 0
     network_debug = _attach_captcha_network_debug(page, prefix) if os.getenv("CAPTCHA_DEBUG_NETWORK") else None
+    max_config_attempts = max(1, int(config.attempts))
+    max_focus_miss_retries = max(2, int(os.getenv("CAPTCHA_FOCUS_MISS_RETRIES", "4") or "4"))
+    consumed_attempts = 0
+    focus_miss_retries = 0
 
-    for attempt in range(1, max(1, config.attempts) + 1):
+    while consumed_attempts < max_config_attempts:
+        attempt = consumed_attempts + 1
         try:
             if timed_out():
                 return CaptchaSolverResult(ok=False, message="AI 滑块处理整体超时", attempts=attempt - 1)
@@ -201,6 +206,7 @@ def solve_slider_captcha(
 
             if not _wait_for_captcha_ready(page, stop_event=stop_event, timeout=8):
                 last_message = "验证码图片加载超时"
+                consumed_attempts += 1
                 print(f"  ⚠️ {prefix}{last_message}，尝试刷新后重试")
                 _try_refresh_captcha(root)
                 if not _wait_for_captcha_ready(page, stop_event=stop_event, timeout=10):
@@ -218,10 +224,22 @@ def solve_slider_captcha(
                     )
                 except Exception:
                     pass
-                if _try_aliyun_callback_success(page):
-                    _sleep(5, stop_event)
-                    if _captcha_solved(page):
-                        return CaptchaSolverResult(ok=True, message="本地靶场回调实验已通过滑块", attempts=attempt)
+                callback_called = False
+                for callback_attempt in range(1, 6):
+                    if _is_cancelled(stop_event):
+                        return CaptchaSolverResult(ok=False, message="AI 滑块处理已取消", attempts=attempt - 1)
+                    if _try_aliyun_callback_success(page):
+                        callback_called = True
+                        _sleep(1, stop_event)
+                        if _captcha_solved(page):
+                            print(f"  ✅ {prefix}本地靶场回调实验已通过滑块")
+                            return CaptchaSolverResult(ok=True, message="本地靶场回调实验已通过滑块", attempts=attempt)
+                    if callback_attempt < 5:
+                        _sleep(0.25, stop_event)
+                if not callback_called:
+                    print(f"  ⚠️ {prefix}本地靶场回调实验未命中 Aliyun 配置，继续自动滑块")
+                else:
+                    print(f"  ⚠️ {prefix}本地靶场回调已触发但验证码仍可见，继续自动滑块")
                 if network_debug:
                     _dump_captcha_network_debug(network_debug, prefix)
                     _dump_captcha_dom_debug(page, prefix)
@@ -269,6 +287,7 @@ def solve_slider_captcha(
             local_source = drag_plan.get("source")
             if mode == "ddddocr" and local_source not in {"ddddocr", "图像匹配校准"}:
                 last_message = "ddddocr 本地识别未能得到可用滑块缺口"
+                consumed_attempts += 1
                 print(f"  ⚠️ {prefix}{last_message}，尝试刷新后重试")
                 _try_refresh_captcha(root)
                 _sleep(0.5, stop_event)
@@ -318,6 +337,7 @@ def solve_slider_captcha(
                 last_corrected_target_x = None
             last_target_signature = current_signature
             target_alternatives = drag_plan.get("target_x_alternatives")
+            selected_target_index: Optional[int] = None
             if last_corrected_target_x is not None:
                 if isinstance(target_alternatives, list):
                     base_targets = list(target_alternatives)
@@ -419,6 +439,8 @@ def solve_slider_captcha(
             if drag_plan.get("quadratic_strategy_distance") is not None:
                 strategy_text = "快速三段" if drag_plan.get("fast_quadratic") else "二次曲线"
                 print(f"  🎯 {prefix}{strategy_text}反算距离: {float(drag_plan['quadratic_strategy_distance']):.1f}px")
+            if drag_plan.get("success_profile_strategy_distance") is not None:
+                print(f"  🎯 {prefix}成功轨迹反算距离: {float(drag_plan['success_profile_strategy_distance']):.1f}px")
             if drag_plan.get("scaled_strategy_distance") is not None:
                 print(f"  🎯 {prefix}缩放轨迹距离: {float(drag_plan['scaled_strategy_distance']):.1f}px")
             if drag_plan.get("drag_backend"):
@@ -472,16 +494,49 @@ def solve_slider_captcha(
             if network_debug:
                 _dump_captcha_network_debug(network_debug, prefix)
                 _dump_captcha_dom_debug(page, prefix)
-            print(f"  ⚠️ {prefix}{last_message}，刷新验证码后重试")
-            try:
-                _try_refresh_captcha(root)
-            except Exception:
-                pass
-            _sleep(_captcha_retry_reset_wait_seconds(), stop_event)
-            _wait_for_captcha_ready(page, stop_event=stop_event, timeout=5)
+            has_unused_target_alternative = (
+                isinstance(target_alternatives, list)
+                and selected_target_index is not None
+                and selected_target_index + 1 < len(target_alternatives)
+                and attempt < max_config_attempts
+            )
+            consumed_attempts += 1
+            focus_miss_retries = 0
+            if has_unused_target_alternative:
+                next_target = target_alternatives[selected_target_index + 1]
+                print(
+                    f"  ⚠️ {prefix}{last_message}，保留当前验证码并尝试下一候选目标 "
+                    f"{float(next_target):.1f}px"
+                )
+                _sleep(0.25, stop_event)
+                continue
+            if consumed_attempts < max_config_attempts:
+                print(f"  ⚠️ {prefix}{last_message}，刷新验证码后重试")
+                try:
+                    _try_refresh_captcha(root)
+                except Exception:
+                    pass
+                _sleep(_captcha_retry_reset_wait_seconds(), stop_event)
+                _wait_for_captcha_ready(page, stop_event=stop_event, timeout=5)
+            else:
+                print(f"  ⚠️ {prefix}{last_message}，已无剩余自动尝试")
         except Exception as exc:
             last_message = str(exc)
+            candidate_plan = locals().get("drag_plan", {})
+            focus_miss = _is_focus_miss_drag_exception(exc, candidate_plan if isinstance(candidate_plan, dict) else {})
             print(f"  ⚠️ {prefix}AI 滑块处理异常: {last_message}")
+            if focus_miss and not _is_cancelled(stop_event) and focus_miss_retries < max_focus_miss_retries:
+                focus_miss_retries += 1
+                print(
+                    f"  🔁 {prefix}焦点未命中不计入滑块尝试，重新置顶后重试当前验证码 "
+                    f"({focus_miss_retries}/{max_focus_miss_retries})",
+                    flush=True,
+                )
+                ensure_page_topmost_foreground(page, label=label, attempts=4, delay=0.3)
+                _sleep(0.4, stop_event)
+                continue
+            consumed_attempts += 1
+            focus_miss_retries = 0
             try:
                 root = _find_captcha_root(page)
                 if root is not None:
@@ -494,7 +549,7 @@ def solve_slider_captcha(
     return CaptchaSolverResult(
         ok=False,
         message=f"AI 滑块处理失败: {last_message}",
-        attempts=max(1, config.attempts),
+        attempts=max_config_attempts,
         distance=last_distance,
         screenshot_path=last_screenshot,
     )
@@ -555,10 +610,20 @@ def install_aliyun_verify_success_route(page: Any) -> None:
         try:
             request = route.request
             post_data = str(getattr(request, "post_data", "") or "")
-            if "VerifyCaptchaV2" not in post_data:
+            url = str(getattr(request, "url", "") or "")
+            combined = f"{url}&{post_data}"
+            if "VerifyCaptchaV2" not in combined:
                 return route.continue_()
-            summary = _summarize_verify_record({"post_data": post_data})
+            summary = _summarize_verify_record({"url": url, "post_data": post_data})
+            if "action" not in summary and "VerifyCaptchaV2" in url:
+                summary["action"] = "VerifyCaptchaV2"
             certify_id = str(summary.get("certifyId") or "")
+            if not certify_id and url:
+                try:
+                    query = parse_qs(urlparse(url).query, keep_blank_values=True)
+                    certify_id = str((query.get("CertifyId") or query.get("certifyId") or [""])[0])
+                except Exception:
+                    certify_id = ""
             body = json.dumps(
                 {
                     "RequestId": "LOCAL-CTF-BYPASS",
@@ -567,28 +632,36 @@ def install_aliyun_verify_success_route(page: Any) -> None:
                     "Code": "Success",
                     "Success": True,
                     "Result": {
-                        "VerifyCode": "PASS",
+                        "VerifyCode": "T001",
                         "VerifyResult": True,
                         "certifyId": certify_id,
+                        "CertifyId": certify_id,
                     },
                 },
                 ensure_ascii=False,
+            )
+            print(
+                "  🧪 本地靶场 Verify 响应替换已命中"
+                + (f": certifyId={certify_id}" if certify_id else ""),
+                flush=True,
             )
             route.fulfill(
                 status=200,
                 headers={"content-type": "application/json;charset=utf-8"},
                 body=body,
             )
-        except Exception:
+        except Exception as exc:
             try:
+                print(f"  ⚠️ 本地靶场 Verify 响应替换异常，已放行原请求: {exc}", flush=True)
                 route.continue_()
             except Exception:
                 pass
 
     try:
         page.route("**/*", handler)
-    except Exception:
-        pass
+        print("  🧪 已安装本地靶场 Verify 响应替换路由", flush=True)
+    except Exception as exc:
+        print(f"  ⚠️ 本地靶场 Verify 响应替换路由安装失败: {exc}", flush=True)
 
 
 def install_aliyun_callback_probe(page: Any) -> None:
@@ -831,7 +904,8 @@ def _try_aliyun_callback_success(page: Any, certify_id: str = "") -> bool:
     """本地靶场实验：尝试直接触发 AliyunCaptcha 成功回调。默认不启用。
 
     Aliyun 前端成功路径会把 certifyId 包装成 base64 JSON 字符串后传给业务 success 回调；
-    Qwen 业务回调会把这个字符串作为 u_asig。旧的对象入参会变成 [object Object]。
+    Qwen 业务回调会把这个字符串作为 u_asig。验证码配置可能存在于
+    Aliyun iframe/子 frame 中，因此需要同时检查 page 与所有 frame。
     """
     script = """
     (certifyId) => {
@@ -885,15 +959,30 @@ def _try_aliyun_callback_success(page: Any, certify_id: str = "") -> bool:
       return called;
     }
     """
-    try:
-        return bool(page.evaluate(script, certify_id))
-    except TypeError:
+
+    def evaluate_on(target: Any) -> bool:
         try:
-            return bool(page.evaluate(script))
+            return bool(target.evaluate(script, certify_id))
+        except TypeError:
+            try:
+                return bool(target.evaluate(script))
+            except Exception:
+                return False
         except Exception:
             return False
+
+    if evaluate_on(page):
+        return True
+    try:
+        frames = list(getattr(page, "frames", []) or [])
     except Exception:
-        return False
+        frames = []
+    for frame in frames:
+        if frame is page:
+            continue
+        if evaluate_on(frame):
+            return True
+    return False
 
 
 
@@ -1338,8 +1427,49 @@ def _wait_for_captcha_ready(page: Any, *, stop_event: Optional[Any] = None, time
                     if (!el) return false;
                     const src = String(el.currentSrc || el.src || '');
                     if (!src) return false;
-                    if (src.startsWith('data:image/')) return true;
                     return el.complete !== false && (el.naturalWidth || 0) > 20 && (el.naturalHeight || 0) > 20;
+                  };
+                  const imageHasVisualContent = el => {
+                    if (!imageReady(el)) return false;
+                    const src = String(el.currentSrc || el.src || '');
+                    // HTTP(S) 图片可能受跨域 canvas 限制，保持旧逻辑只校验加载状态；
+                    // data URL 可直接采样，避免灰色 loading 占位图被误判为可拖动。
+                    if (!src.startsWith('data:image/')) return true;
+                    try {
+                      const width = Math.max(1, el.naturalWidth || el.width || 1);
+                      const height = Math.max(1, el.naturalHeight || el.height || 1);
+                      const sampleWidth = Math.min(48, width);
+                      const sampleHeight = Math.min(32, height);
+                      const canvas = document.createElement('canvas');
+                      canvas.width = sampleWidth;
+                      canvas.height = sampleHeight;
+                      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                      if (!ctx) return true;
+                      ctx.drawImage(el, 0, 0, sampleWidth, sampleHeight);
+                      const data = ctx.getImageData(0, 0, sampleWidth, sampleHeight).data;
+                      let count = 0;
+                      let minLum = 255;
+                      let maxLum = 0;
+                      let colorSpreadTotal = 0;
+                      for (let i = 0; i < data.length; i += 4) {
+                        const alpha = data[i + 3];
+                        if (alpha < 24) continue;
+                        const r = data[i];
+                        const g = data[i + 1];
+                        const b = data[i + 2];
+                        const lum = (r + g + b) / 3;
+                        minLum = Math.min(minLum, lum);
+                        maxLum = Math.max(maxLum, lum);
+                        colorSpreadTotal += Math.max(r, g, b) - Math.min(r, g, b);
+                        count += 1;
+                      }
+                      if (count < 50) return false;
+                      const luminanceRange = maxLum - minLum;
+                      const colorSpread = colorSpreadTotal / count;
+                      return luminanceRange >= 35 || colorSpread >= 10;
+                    } catch (e) {
+                      return true;
+                    }
                   };
                   const visibleBox = el => {
                     if (!el) return null;
@@ -1349,14 +1479,21 @@ def _wait_for_captcha_ready(page: Any, *, stop_event: Optional[Any] = None, time
                   const imgBox = visibleBox(img);
                   const puzzleBox = visibleBox(puzzle);
                   const sliderBox = visibleBox(slider);
+                  const visualContentReady = imageHasVisualContent(img);
                   const ready = Boolean(
                     img && puzzle && slider &&
                     imageReady(img) && imageReady(puzzle) &&
+                    visualContentReady &&
                     imgBox && imgBox.width > 100 && imgBox.height > 80 &&
                     puzzleBox && puzzleBox.width > 10 && puzzleBox.height > 50 &&
                     sliderBox && sliderBox.width > 10 && sliderBox.height > 10
                   );
-                  return {ready, aliyun: true, reason: ready ? '已就绪' : '图片加载中'};
+                  return {
+                    ready,
+                    aliyun: true,
+                    visualContentReady,
+                    reason: ready ? '已就绪' : (visualContentReady ? '图片加载中' : '图片仍是加载占位')
+                  };
                 }
                 """
             )
@@ -1817,17 +1954,35 @@ def _choose_aliyun_target_x(
         return float(match_x), "图像匹配校准"
 
     if white_gap_x is not None and float(white_gap_x) >= min_real_target_x:
+        if (
+            match_x is not None
+            and float(match_x) >= min_real_target_x
+            and float(match_x) < ddddocr_x
+            and float(white_gap_x) < ddddocr_x
+            and ddddocr_x < float(image_width) * 0.72
+        ):
+            # 最新 Camoufox 真实日志中，ddddocr 位于中部且亮色/模板候选都在左侧时，
+            # 优先使用左侧局部候选会连续失败；这类局部候选更像背景高亮误检。
+            return ddddocr_x, "ddddocr"
         white_delta = abs(float(white_gap_x) - ddddocr_x)
-        local_candidates_right_of_ddddocr = (
+        right_local_cluster = (
             match_x is not None
             and float(match_x) >= min_real_target_x
             and float(match_x) > ddddocr_x + 35.0
             and float(white_gap_x) > ddddocr_x + 55.0
             and abs(float(match_x) - float(white_gap_x)) <= 45.0
         )
+        if right_local_cluster and ddddocr_x >= float(image_width) * 0.58:
+            # ddddocr 已在中右部时，右侧亮色/模板簇很可能是背景误检；保留它们
+            # 作为后续候选，但首轮应先试 ddddocr，减少整组验证码被错误候选耗尽。
+            return ddddocr_x, "ddddocr"
+        local_candidates_right_of_ddddocr = (
+            right_local_cluster
+            and ddddocr_x < float(image_width) * 0.58
+        )
         white_clearly_right = (
             float(white_gap_x) > ddddocr_x + 35.0
-            and not local_candidates_right_of_ddddocr
+            and not right_local_cluster
             and (
                 match_x is None
                 or float(match_x) <= ddddocr_x + 12.0
@@ -1962,7 +2117,9 @@ def _target_x_alternatives(
 def _configured_target_right_bias() -> float:
     raw = os.getenv("CAPTCHA_TARGET_RIGHT_BIAS", "").strip()
     if not raw:
-        return 0.0
+        # 近期 Camoufox/本地靶场日志显示松手前 puzzleLeft 稳定比目标右侧多约 4~6px，
+        # 默认轻微左偏可抵消释放/非线性拖动的系统性过冲；显式环境变量或 CLI 仍可覆盖。
+        return -5.0
     try:
         value = float(raw)
     except Exception:
@@ -2146,6 +2303,17 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
             )
             plan["quadratic_strategy_distance"] = distance
             _drag_aliyun_human_like(mouse, start_x, start_y, distance)
+        elif drag_strategy in {"success_profile", "recorded_profile", "profile"}:
+            distance = _estimate_aliyun_nonlinear_slider_distance(
+                target_x=float(calibrate_target_x),
+                max_distance=max_distance,
+            )
+            plan["success_profile_strategy_distance"] = distance
+            _drag_aliyun_success_profile(mouse, start_x, start_y, distance)
+            if _success_profile_final_alignment_enabled():
+                distance = _apply_final_alignment(
+                    page, mouse, plan, start_x, start_y, distance, max_distance, float(calibrate_target_x)
+                )
         elif drag_strategy in {"fast_quadratic", "quick_quadratic"}:
             distance = _estimate_aliyun_nonlinear_slider_distance(
                 target_x=float(calibrate_target_x),
@@ -2154,7 +2322,7 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
             plan["quadratic_strategy_distance"] = distance
             plan["fast_quadratic"] = True
             _drag_aliyun_fast_three_stage(mouse, start_x, start_y, distance)
-            if os.getenv("CAPTCHA_FAST_QUADRATIC_FINAL_ALIGNMENT", "").strip().lower() in {"1", "true", "yes", "y"}:
+            if _fast_quadratic_final_alignment_enabled():
                 distance = _apply_final_alignment(
                     page, mouse, plan, start_x, start_y, distance, max_distance, float(calibrate_target_x)
                 )
@@ -2646,6 +2814,45 @@ ALIYUN_SUCCESS_PROFILE_POINTS: tuple[tuple[float, float, float], ...] = (
     (0.9915, 1.0000, 1.0),
     (1.0000, 1.0000, -1.0),
 )
+
+
+def _success_profile_duration_seconds() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_SUCCESS_PROFILE_DURATION", "1.05"))
+    except Exception:
+        value = 1.05
+    return max(0.35, min(value, 2.5))
+
+
+def _success_profile_final_alignment_enabled() -> bool:
+    raw = os.getenv("CAPTCHA_SUCCESS_PROFILE_FINAL_ALIGNMENT", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "n", "off"}
+
+
+def _drag_aliyun_success_profile(mouse: Any, start_x: float, start_y: float, distance: float) -> None:
+    """按已验证成功的 Aliyun 轨迹比例拖动。
+
+    最新 Camoufox 日志显示多数失败并不是焦点未命中，而是拼图已停在目标
+    附近后仍被服务端判失败，说明轨迹形态比末端坐标更关键。这里复用
+    之前录制的成功样本比例：先短距离抓稳滑块，再快速接近，轻微过冲，
+    多段回调，最后精确回到目标距离。
+    """
+    duration = _success_profile_duration_seconds()
+    previous_time = 0.0
+    # Windows 真实鼠标在按下后如果第一段位移太大，偶发不会被页面滑块组件
+    # 捕获。先做一个极短的抓稳动作，再进入录制比例轨迹。
+    _mouse_move(mouse, start_x + 1.2, start_y + random.uniform(-0.25, 0.25), steps=3)
+    time.sleep(random.uniform(0.04, 0.08))
+    for time_ratio, x_ratio, y_delta in ALIYUN_SUCCESS_PROFILE_POINTS:
+        current_time = max(previous_time, min(float(time_ratio), 1.0))
+        delay = max(0.0, (current_time - previous_time) * duration)
+        if delay:
+            time.sleep(delay * random.uniform(0.85, 1.15))
+        jitter_y = float(y_delta) + random.uniform(-0.35, 0.35)
+        _mouse_move(mouse, start_x + float(distance) * float(x_ratio), start_y + jitter_y, steps=1)
+        previous_time = current_time
 
 
 def _drag_aliyun_fast_three_stage(mouse: Any, start_x: float, start_y: float, distance: float) -> None:
@@ -3161,6 +3368,13 @@ def _dampen_local_adjustment(adjustment: float, *, fast_quadratic: bool = False)
     return value * 0.65
 
 
+def _fast_quadratic_final_alignment_enabled() -> bool:
+    raw = os.getenv("CAPTCHA_FAST_QUADRATIC_FINAL_ALIGNMENT", "").strip().lower()
+    if not raw:
+        return False
+    return raw not in {"0", "false", "no", "n", "off"}
+
+
 def _calibrate_distance_from_motion_probe(
     plan: dict[str, float],
     state: Optional[dict[str, float]],
@@ -3248,18 +3462,37 @@ def _measure_aliyun_motion_ratio(page: Any, initial_state: Optional[dict[str, fl
         return None
     return None
 
+_CAPTCHA_PENDING_WORDS = [
+    "access verification",
+    "please complete the operation",
+    "please complete the o",
+    "drag the slider",
+    "拖动滑块",
+    "请完成以下操作",
+    "验证您是真人",
+    "拖动滑块完成拼图",
+]
+
+
+def _page_body_has_pending_captcha_text(page: Any) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=1000).lower()
+    except Exception:
+        return False
+    return any(word in body_text for word in _CAPTCHA_PENDING_WORDS)
+
+
 def _captcha_solved(page: Any) -> bool:
     root = _find_captcha_root(page)
     if root is None:
-        return True
+        return not _page_body_has_pending_captcha_text(page)
     try:
         text = root.inner_text(timeout=1000).lower()
-        pending_words = ["拖动滑块完成拼图", "请完成以下操作", "验证您是真人"]
-        if any(word in text for word in pending_words):
+        if any(word in text for word in _CAPTCHA_PENDING_WORDS):
             return False
         success_words = ["验证通过", "验证成功", "success", "passed", "verification success"]
         if any(word in text for word in success_words):
-            return True
+            return not _page_body_has_pending_captcha_text(page)
     except Exception:
         pass
     return False
@@ -3267,9 +3500,9 @@ def _captcha_solved(page: Any) -> bool:
 
 def _captcha_success_wait_seconds() -> float:
     try:
-        return max(1.0, float(os.getenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "3.5")))
+        return max(1.0, float(os.getenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "5.0")))
     except Exception:
-        return 3.5
+        return 5.0
 
 
 def _captcha_retry_reset_wait_seconds() -> float:
@@ -3307,14 +3540,27 @@ def _wait_for_captcha_success(
     再检查一次页面，会把实际已通过的滑块误判为失败。
     """
     deadline = time.time() + max(0.0, timeout)
+    stable_hits = 0
+    stable_since: Optional[float] = None
+    required_stable_seconds = 1.0
     while True:
         if _is_cancelled(stop_event):
             return None
+        now = time.time()
         if _captcha_solved(page):
-            return "页面"
-        if _network_has_aliyun_verify_success(network_records):
-            return "服务端"
-        if time.time() >= deadline:
+            stable_hits += 1
+            if stable_since is None:
+                stable_since = now
+            if stable_hits >= 2 and now - stable_since >= required_stable_seconds:
+                return "页面"
+        else:
+            stable_hits = 0
+            stable_since = None
+        # 只看到 VerifyCaptchaV2 返回成功还不足以说明前端/业务层已经放行。
+        # 最新 Camoufox 真实日志中出现过服务端响应被替换为成功，但页面仍停留在
+        # Access Verification 的情况；此时若直接返回成功，会跳过剩余重试并导致
+        # 注册阶段误判。因此真正成功必须由页面验证码消失或成功文案确认且保持稳定。
+        if now >= deadline:
             return None
         _sleep(0.5, stop_event)
 
@@ -3399,3 +3645,5 @@ def _sleep(seconds: float, stop_event: Optional[Any]) -> None:
         if _is_cancelled(stop_event):
             return
         time.sleep(min(0.2, max(0.0, end_time - time.time())))
+
+

@@ -388,7 +388,9 @@ def test_workers_guard_foreground_sensitive_launch_and_new_page():
     assert "acquire_foreground_window_lock(label=f\"{label} 浏览器启动\"" in normal_source
     assert "acquire_foreground_window_lock(label=f\"{label} 新建注册页\"" in normal_source
     assert "acquire_foreground_window_lock(label=f\"{label} Camoufox 启动\"" in camoufox_source
-    assert "acquire_foreground_window_lock(label=f\"{label} 新建注册页\"" in camoufox_source
+    # Camoufox new_page 偶发卡顿几十秒；它不应长时间持有前台窗口锁，
+    # 否则会阻塞后续滑块。滑块阶段仍由 register_qwen 内的 slider 锁保护。
+    assert "acquire_foreground_window_lock(label=f\"{label} 新建注册页\"" not in camoufox_source
     assert "with acquire_slider_lock(label=label" in inspect.getsource(qwenv4.register_qwen)
 
 

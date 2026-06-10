@@ -64,13 +64,30 @@ class MailtmProvider(EmailProvider):
     ) -> httpx.Response:
         rate_retries = 0
         unavailable_retries = 0
+        network_retries = 0
         auth_retried = False
         while True:
             try:
                 response = self.client.request(method, self._url(path), **kwargs)
             except httpx.TimeoutException as exc:
+                if network_retries < max_429_retries:
+                    network_retries += 1
+                    delay = sleep_rate_limit_retry()
+                    self.log_debug(
+                        f"Mail.tm 网络超时，随机 {delay_to_milliseconds(delay)}ms 后重试 "
+                        f"({network_retries}/{max_429_retries}): {exc}"
+                    )
+                    continue
                 raise EmailCreationError(f"Mail.tm 网络超时: {exc}") from exc
             except httpx.HTTPError as exc:
+                if network_retries < max_429_retries:
+                    network_retries += 1
+                    delay = sleep_rate_limit_retry()
+                    self.log_debug(
+                        f"Mail.tm 网络错误，随机 {delay_to_milliseconds(delay)}ms 后重试 "
+                        f"({network_retries}/{max_429_retries}): {exc}"
+                    )
+                    continue
                 raise EmailCreationError(f"Mail.tm 网络错误: {exc}") from exc
 
             if response.status_code == 429 and rate_retries < max_429_retries:

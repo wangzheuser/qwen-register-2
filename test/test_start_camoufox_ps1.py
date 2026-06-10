@@ -207,6 +207,12 @@ def test_start_script_manual_mode_uses_timeout(tmp_path):
     command = without_log_arg(result.stdout)
     assert "qwenv4_camoufox.py 1 --email-provider mailtm --concurrency 1 --account-retries 3 --captcha-solver manual --captcha-timeout 456 --strict" in command
     assert "--captcha-ai-attempts" not in command
+    assert "--captcha-callback-bypass" not in command
+    assert "--captcha-force-verify-success" not in command
+
+
+
+
 
 
 

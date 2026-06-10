@@ -216,7 +216,7 @@ Path('launched.json').write_text(json.dumps({'argv': sys.argv[1:]}, ensure_ascii
             "os",
             "--captcha-drag-strategy",
             "fast_quadratic",
-            "--strict",
+                    "--strict",
         ]
 
 
@@ -318,6 +318,7 @@ def test_start_script_manual_mode_uses_timeout(tmp_path):
     command = without_log_arg(result.stdout)
     assert "qwenv4.py 1 --email-provider mailtm --concurrency 1 --account-retries 3 --captcha-solver manual --captcha-timeout 456 --strict" in command
     assert "--captcha-ai-attempts" not in command
+
 
 
 

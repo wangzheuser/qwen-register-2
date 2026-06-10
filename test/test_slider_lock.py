@@ -260,3 +260,122 @@ def test_slider_file_lock_timeout_releases_foreground_coordinator(tmp_path):
     with acquire_foreground_window_lock("[窗口]", lock_path=lock_path, poll_interval=0.005):
         assert True
 
+
+def test_window_lock_does_not_wait_for_cross_process_foreground_file_lock(tmp_path):
+    """window 不持有/等待主滑块文件锁，避免 Camoufox new_page 卡住拖死滑块。"""
+    lock_path = tmp_path / "cross-process-foreground.lock"
+
+    with portalocker.Lock(str(lock_path), timeout=0):
+        with acquire_foreground_window_lock(
+            "[窗口]",
+            lock_path=lock_path,
+            poll_interval=0.005,
+            file_lock_timeout=0.03,
+        ):
+            assert True
+
+
+def test_window_lock_waits_while_cross_process_slider_intent_exists(tmp_path):
+    """跨进程滑块正在占用前台时，window 操作不能进入抢焦点。"""
+    lock_path = tmp_path / "cross-process-intent.lock"
+    intent_path = tmp_path / "cross-process-intent.lock.intent"
+
+    with portalocker.Lock(str(intent_path), timeout=0):
+        with pytest.raises(SliderLockTimeout):
+            with acquire_foreground_window_lock(
+                "[窗口]",
+                lock_path=lock_path,
+                poll_interval=0.005,
+                file_lock_timeout=0.03,
+            ):
+                pytest.fail("slider intent 存在时 window 不应进入前台临界区")
+
+
+
+def test_window_locks_can_overlap_without_slider_intent(tmp_path):
+    """没有 slider 意图时，跨进程 window 操作应共享前台锁，避免启动阶段全局串行化。"""
+    lock_path = tmp_path / "shared-window.lock"
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    entered = []
+
+    def first_window():
+        with acquire_foreground_window_lock("[窗口1]", lock_path=lock_path, poll_interval=0.005):
+            entered.append("first")
+            first_entered.set()
+            release_first.wait(timeout=2)
+
+    thread = threading.Thread(target=first_window)
+    thread.start()
+    assert first_entered.wait(timeout=2)
+
+    with acquire_foreground_window_lock("[窗口2]", lock_path=lock_path, poll_interval=0.005):
+        entered.append("second")
+
+    release_first.set()
+    thread.join(timeout=2)
+
+    assert entered == ["first", "second"]
+
+def test_window_intent_timeout_does_not_poison_local_window_lock(tmp_path):
+    """跨进程 slider intent 等待超时后，必须释放本进程 window owner。"""
+    lock_path = tmp_path / "window-intent-timeout.lock"
+    intent_path = tmp_path / "window-intent-timeout.lock.intent"
+
+    with portalocker.Lock(str(intent_path), timeout=0):
+        with pytest.raises(SliderLockTimeout):
+            with acquire_foreground_window_lock(
+                "[窗口等待]",
+                lock_path=lock_path,
+                poll_interval=0.005,
+                file_lock_timeout=0.03,
+            ):
+                pytest.fail("slider intent 存在时 window 不应进入")
+
+    with acquire_foreground_window_lock("[窗口恢复]", lock_path=lock_path, poll_interval=0.005):
+        assert True
+
+
+def test_window_lock_waits_on_cross_process_slider_intent(tmp_path, monkeypatch):
+    from captcha_solvers import slider_lock
+
+    if slider_lock.portalocker is None:
+        pytest.skip("portalocker 不可用")
+
+    lock_path = tmp_path / "slider.lock"
+    intent_path = slider_lock._foreground_intent_lock_path(lock_path)
+    blocker = slider_lock.portalocker.Lock(str(intent_path), timeout=0, flags=slider_lock.portalocker.LockFlags.EXCLUSIVE | slider_lock.portalocker.LockFlags.NON_BLOCKING)
+    blocker.acquire()
+    try:
+        with pytest.raises(SliderLockTimeout):
+            with slider_lock.acquire_foreground_window_lock(
+                label="window-test",
+                lock_path=lock_path,
+                poll_interval=0.005,
+                file_lock_timeout=0.03,
+            ):
+                pytest.fail("slider intent 存在时 window 不应进入")
+    finally:
+        blocker.release()
+
+
+def test_slider_waiting_on_file_lock_does_not_claim_foreground_lock(tmp_path, capsys):
+    from captcha_solvers import slider_lock
+
+    if slider_lock.portalocker is None:
+        pytest.skip("portalocker 不可用")
+
+    lock_path = tmp_path / "claimed-too-early.lock"
+    with slider_lock.portalocker.Lock(str(lock_path), timeout=0):
+        with pytest.raises(SliderLockTimeout):
+            with acquire_slider_lock(
+                "[等待者]",
+                lock_path=lock_path,
+                poll_interval=0.005,
+                file_lock_timeout=0.03,
+            ):
+                pytest.fail("文件锁被占用时不应进入滑块临界区")
+
+    output = capsys.readouterr().out
+    assert "[等待者] 已获得前台焦点锁 type=slider" not in output
+    assert "[等待者] 释放前台焦点锁 type=slider" not in output

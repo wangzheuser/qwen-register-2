@@ -18,7 +18,16 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_SLIDER_LOCK_PATH = Path(".slider-captcha.lock")
-DEFAULT_SLIDER_FILE_LOCK_TIMEOUT = 20.0
+DEFAULT_SLIDER_FILE_LOCK_TIMEOUT = 240.0
+
+
+def _foreground_intent_lock_path(lock_path: str | Path) -> Path:
+    """跨进程前台意图锁路径。
+
+    该锁用于在真正持有前台文件锁前声明“将要使用前台”。slider/window
+    都需要持有它，从而避免一个进程已经准备拖滑块时，另一个进程新建窗口抢前台。
+    """
+    return Path(f"{lock_path}.intent")
 
 
 class SliderLockTimeout(RuntimeError):
@@ -31,7 +40,9 @@ class _ForegroundRequest:
     kind: str
     label: str
     queued_at: float
+    reserved_at: float = 0.0
     acquired_at: float = 0.0
+    acquired_logged: bool = False
 
     @property
     def display_label(self) -> str:
@@ -66,6 +77,7 @@ class ForegroundCoordinator:
         *,
         stop_event: Optional[object] = None,
         poll_interval: float = 0.2,
+        announce_acquired: bool = True,
     ) -> _ForegroundRequest:
         if kind not in {"slider", "window"}:
             raise ValueError(f"未知前台锁类型: {kind}")
@@ -92,29 +104,39 @@ class ForegroundCoordinator:
                     raise SliderLockTimeout(f"等待前台焦点锁 type={kind} 时收到停止请求")
                 if self._can_acquire(request):
                     self._queue_for(kind).popleft()
-                    request.acquired_at = time.monotonic()
+                    request.reserved_at = time.monotonic()
                     self._owner = request
-                    waited = request.acquired_at - request.queued_at
-                    print(
-                        f"  🔐 {self._prefix(request)}已获得前台焦点锁 "
-                        f"type={kind} waited={_format_seconds(waited)} "
-                        f"queue_slider={len(self._slider_queue)} queue_window={len(self._window_queue)}",
-                        flush=True,
-                    )
+                    if announce_acquired:
+                        self.announce_acquired(request)
                     return request
                 self._condition.wait(timeout=poll_interval)
+
+    def announce_acquired(self, request: _ForegroundRequest) -> None:
+        with self._condition:
+            if self._owner is not request or request.acquired_logged:
+                return
+            request.acquired_at = time.monotonic()
+            request.acquired_logged = True
+            waited = request.acquired_at - request.queued_at
+            print(
+                f"  🔐 {self._prefix(request)}已获得前台焦点锁 "
+                f"type={request.kind} waited={_format_seconds(waited)} "
+                f"queue_slider={len(self._slider_queue)} queue_window={len(self._window_queue)}",
+                flush=True,
+            )
 
     def release(self, request: _ForegroundRequest) -> None:
         with self._condition:
             if self._owner is not request:
                 return
-            held = time.monotonic() - request.acquired_at if request.acquired_at else 0.0
-            print(
-                f"  🔓 {self._prefix(request)}释放前台焦点锁 "
-                f"type={request.kind} held={_format_seconds(held)} "
-                f"queue_slider={len(self._slider_queue)} queue_window={len(self._window_queue)}",
-                flush=True,
-            )
+            if request.acquired_logged:
+                held = time.monotonic() - request.acquired_at if request.acquired_at else 0.0
+                print(
+                    f"  🔓 {self._prefix(request)}释放前台焦点锁 "
+                    f"type={request.kind} held={_format_seconds(held)} "
+                    f"queue_slider={len(self._slider_queue)} queue_window={len(self._window_queue)}",
+                    flush=True,
+                )
             self._owner = None
             self._condition.notify_all()
 
@@ -152,6 +174,49 @@ class ForegroundCoordinator:
 _COORDINATOR = ForegroundCoordinator()
 
 
+def _acquire_foreground_file_lock(
+    *,
+    kind: str,
+    label: str,
+    lock_path: str | Path,
+    stop_event: Optional[object],
+    poll_interval: float,
+    file_lock_timeout: float,
+    flags: Optional[object] = None,
+):
+    """获取跨进程前台文件锁；portalocker 不可用时返回空锁。"""
+    if portalocker is None:
+        return None
+
+    if flags is None:
+        flags = portalocker.LockFlags.EXCLUSIVE
+    file_lock = portalocker.Lock(str(lock_path), timeout=0, flags=flags)
+    wait_started = time.monotonic()
+    last_wait_log = wait_started
+    while True:
+        if _cancelled(stop_event):
+            raise SliderLockTimeout(f"等待前台焦点文件锁 type={kind} 时收到停止请求")
+        try:
+            file_lock.acquire()
+            return file_lock
+        except portalocker.exceptions.LockException:
+            elapsed = time.monotonic() - wait_started
+            if elapsed >= file_lock_timeout:
+                raise SliderLockTimeout(
+                    f"等待前台焦点文件锁 type={kind} 超时 "
+                    f"({elapsed:.1f}s/{file_lock_timeout:.1f}s)"
+                )
+            now = time.monotonic()
+            if now - last_wait_log >= 5.0:
+                print(
+                    f"  ⏳ {label + ' ' if label else ''}等待前台焦点文件锁 "
+                    f"type={kind} elapsed={elapsed:.1f}s...",
+                    flush=True,
+                )
+                last_wait_log = now
+            time.sleep(poll_interval)
+
+
 @contextmanager
 def acquire_slider_lock(
     label: str = "",
@@ -162,50 +227,53 @@ def acquire_slider_lock(
     file_lock_timeout: float = DEFAULT_SLIDER_FILE_LOCK_TIMEOUT,
 ) -> Iterator[None]:
     """串行化完整滑块处理流程，保护 OS 鼠标、焦点和验证码状态。"""
-    request = _COORDINATOR.acquire(
-        "slider",
-        label=label,
-        stop_event=stop_event,
-        poll_interval=poll_interval,
-    )
+    intent_lock = None
     file_lock = None
-    file_lock_acquired = False
+    request = None
     try:
-        if portalocker is not None:
-            file_lock = portalocker.Lock(str(lock_path), timeout=0)
-            wait_started = time.monotonic()
-            last_wait_log = wait_started
-            while True:
-                if _cancelled(stop_event):
-                    raise SliderLockTimeout("等待前台焦点文件锁 type=slider 时收到停止请求")
-                try:
-                    file_lock.acquire()
-                    file_lock_acquired = True
-                    break
-                except portalocker.exceptions.LockException:
-                    elapsed = time.monotonic() - wait_started
-                    if elapsed >= file_lock_timeout:
-                        raise SliderLockTimeout(
-                            f"等待前台焦点文件锁 type=slider 超时 "
-                            f"({elapsed:.1f}s/{file_lock_timeout:.1f}s)"
-                        )
-                    now = time.monotonic()
-                    if now - last_wait_log >= 5.0:
-                        print(
-                            f"  ⏳ {label + ' ' if label else ''}等待前台焦点文件锁 "
-                            f"type=slider elapsed={elapsed:.1f}s...",
-                            flush=True,
-                        )
-                        last_wait_log = now
-                    time.sleep(poll_interval)
+        # 先进入进程内 FIFO 队列，避免同一进程内多个 slider waiter 在文件锁
+        # 层面反向抢占；但此时只是“预约”前台，不打印“已获得”。真正拿到
+        # 跨进程文件锁后再 announce，避免 Camoufox 多进程日志误导。
+        request = _COORDINATOR.acquire(
+            "slider",
+            label=label,
+            stop_event=stop_event,
+            poll_interval=poll_interval,
+            announce_acquired=False,
+        )
+        intent_lock = _acquire_foreground_file_lock(
+            kind="slider-intent",
+            label=label,
+            lock_path=_foreground_intent_lock_path(lock_path),
+            stop_event=stop_event,
+            poll_interval=poll_interval,
+            file_lock_timeout=file_lock_timeout,
+            flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
+        )
+        file_lock = _acquire_foreground_file_lock(
+            kind="slider",
+            label=label,
+            lock_path=lock_path,
+            stop_event=stop_event,
+            poll_interval=poll_interval,
+            file_lock_timeout=file_lock_timeout,
+            flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
+        )
+        _COORDINATOR.announce_acquired(request)
         yield
     finally:
-        if file_lock is not None and file_lock_acquired:
+        if request is not None:
+            _COORDINATOR.release(request)
+        if file_lock is not None:
             try:
                 file_lock.release()
             except Exception:
                 pass
-        _COORDINATOR.release(request)
+        if intent_lock is not None:
+            try:
+                intent_lock.release()
+            except Exception:
+                pass
 
 
 @contextmanager
@@ -215,19 +283,42 @@ def acquire_foreground_window_lock(
     stop_event: Optional[object] = None,
     lock_path: str | Path = DEFAULT_SLIDER_LOCK_PATH,
     poll_interval: float = 0.2,
+    file_lock_timeout: float = DEFAULT_SLIDER_FILE_LOCK_TIMEOUT,
 ) -> Iterator[None]:
-    """串行化短前台窗口操作；有滑块等待时不能插队。"""
-    _ = lock_path  # 兼容旧调用签名；window 锁不使用跨进程文件锁。
-    request = _COORDINATOR.acquire(
-        "window",
-        label=label,
-        stop_event=stop_event,
-        poll_interval=poll_interval,
-    )
+    """串行化短前台窗口操作；滑块声明前台意图时 window 需避让。
+
+    重要：Camoufox 启动/new_page 偶发卡顿，window 不能长期持有任何跨进程
+    文件锁，否则会把后续 slider 拖死。这里仅在进入前探测 slider intent 是否空闲，
+    探测成功后立即释放文件锁；实际滑块拖动前仍会强制置顶并复检焦点。
+    """
+    request = None
     try:
+        request = _COORDINATOR.acquire(
+            "window",
+            label=label,
+            stop_event=stop_event,
+            poll_interval=poll_interval,
+            announce_acquired=False,
+        )
+        intent_probe = _acquire_foreground_file_lock(
+            kind="window-intent",
+            label=label,
+            lock_path=_foreground_intent_lock_path(lock_path),
+            stop_event=stop_event,
+            poll_interval=poll_interval,
+            file_lock_timeout=file_lock_timeout,
+            flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
+        )
+        if intent_probe is not None:
+            try:
+                intent_probe.release()
+            except Exception:
+                pass
+        _COORDINATOR.announce_acquired(request)
         yield
     finally:
-        _COORDINATOR.release(request)
+        if request is not None:
+            _COORDINATOR.release(request)
 
 
 @contextmanager

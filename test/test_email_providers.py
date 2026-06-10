@@ -195,6 +195,28 @@ def test_mailtm_rate_limit_stops_after_nine_retries(monkeypatch):
     assert sleep_calls == [0.015] * RATE_LIMIT_MAX_RETRIES
 
 
+def test_mailtm_transient_network_error_retries_like_rate_limit(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.021)
+    monkeypatch.setattr("email_providers.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING]", request=request)
+        return httpx.Response(200, json={"hydra:member": []})
+
+    provider = MailtmProvider(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    response = provider._request("GET", "/messages")
+
+    assert response.status_code == 200
+    assert calls == 3
+    assert sleep_calls == [0.021, 0.021]
+
+
 def test_mailporary_rate_limit_stops_after_nine_retries(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.099)

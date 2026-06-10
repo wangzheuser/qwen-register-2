@@ -67,6 +67,7 @@ OUTPUT_FILE_JSON = "qwen_accounts.json"
 IMAGES_DIR = "images"
 HEADLESS = False  # 必须为 False 以支持手动完成验证码
 RUN_LOG_MAX_BYTES = 128 * 1024 * 1024
+POST_CAPTCHA_SUBMISSION_TIMEOUT = 8.0
 
 BROWSER_ARGS = [
     '--disable-blink-features=AutomationControlled',
@@ -299,9 +300,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--captcha-drag-strategy",
-        choices=["auto", "closed_loop", "fast_quadratic", "quadratic", "human", "ratio_human", "scaled"],
+        choices=["auto", "closed_loop", "success_profile", "fast_quadratic", "quadratic", "human", "ratio_human", "scaled"],
         default=os.getenv("CAPTCHA_DRAG_STRATEGY", "fast_quadratic"),
-        help="滑块拖动策略；AI 模式默认: fast_quadratic",
+        help="滑块拖动策略；默认: fast_quadratic",
     )
     parser.add_argument(
         "--captcha-target-right-bias",
@@ -356,6 +357,15 @@ def parse_args(argv=None):
         "--log-file",
         default="",
         help="运行日志文件路径；默认写入单个 logs/qwenv4.log，并在超过 128MB 时自动丢弃最旧内容",
+    )
+    parser.add_argument("--camoufox-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--account-index", type=positive_int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--total-accounts", type=positive_int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--camoufox-account-timeout",
+        type=positive_int,
+        default=int(os.getenv("CAMOUFOX_ACCOUNT_TIMEOUT", "180")),
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
     if args.captcha_drag_backend is None:
@@ -1234,6 +1244,55 @@ def submit_registration_form_background(page, name, email, password):
     return bool(page.evaluate(script, {"name": name, "email": email, "password": password}))
 
 
+def goto_register_page_with_retry(page, attempts=3):
+    """打开注册页；Camoufox/Firefox 代理场景下偶发 NS_ERROR_NET_INTERRUPT，轻量重试。"""
+    last_error = None
+    total = max(1, int(attempts))
+    transient_markers = (
+        "NS_ERROR_NET_INTERRUPT",
+        "NS_BINDING_ABORTED",
+        "net::ERR_ABORTED",
+    )
+    for attempt in range(1, total + 1):
+        try:
+            page.goto(QWEN_REGISTER_URL, wait_until='domcontentloaded', timeout=60000)
+            return True
+        except Exception as e:
+            last_error = e
+            message = str(e)
+            if attempt >= total or not any(marker in message for marker in transient_markers):
+                raise
+            print(f"  ⚠️ 注册页导航被中断，正在重试 ({attempt}/{total}): {message[:120]}")
+            sleep_interruptible(0.5)
+    if last_error is not None:
+        raise last_error
+    return False
+
+
+
+
+def wait_for_captcha_or_submission_after_submit(page, timeout=5.0, interval=0.25):
+    """提交注册表单后短轮询验证码/提交状态，避免无条件固定等待。"""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if STOP_EVENT.is_set():
+            return "stopped"
+        try:
+            if detect_captcha(page):
+                return "captcha"
+        except Exception:
+            pass
+        try:
+            body = page.evaluate('document.body.innerText') or ''
+            if registration_submission_detected(body):
+                return "submitted"
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return "timeout"
+        sleep_interruptible(min(float(interval), max(0.0, deadline - time.monotonic())))
+
+
 def focus_page_for_slider(page, label="", attempts=3, delay=0.3):
     """激活滑块页面并确认可见/焦点状态，避免 OS 鼠标拖到错误窗口。"""
     prefix = f"{label} " if label else ""
@@ -1309,15 +1368,28 @@ def register_qwen(
     print(f"  📝 正在注册 Qwen 账号...")
 
     try:
-        page.goto(QWEN_REGISTER_URL, wait_until='domcontentloaded', timeout=60000)
+        goto_register_page_with_retry(page)
         submit_registration_form_background(page, name=name, email=email, password=password)
 
-        time.sleep(5)
+        submit_state = wait_for_captcha_or_submission_after_submit(page, timeout=5.0)
+        if submit_state == "timeout":
+            try:
+                body_after_submit = page.evaluate('document.body.innerText') or ''
+            except Exception:
+                body_after_submit = ''
+            if 'create account' in body_after_submit.lower() or '创建账号' in body_after_submit:
+                print("  ⚠️ 注册提交后仍停留在表单页，正在重试提交")
+                submit_registration_form_background(page, name=name, email=email, password=password)
+                submit_state = wait_for_captcha_or_submission_after_submit(page, timeout=5.0)
+        if submit_state == "stopped":
+            return False
 
         # 检测是否出现验证码
-        if detect_captcha(page):
+        if submit_state == "captcha" or detect_captcha(page):
             print("  🤖 检测到验证码弹窗")
             label_prefix = f"{label} " if label else ""
+            if os.getenv("CAPTCHA_FORCE_VERIFY_SUCCESS", "").strip():
+                install_aliyun_verify_success_route(page)
             try:
                 with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
                     try:
@@ -1341,7 +1413,7 @@ def register_qwen(
                                     )
                                     if solver_result.ok:
                                         print(f"  ✅ {label_prefix}{solver_result.message}")
-                                        wait_for_registration_submission(page, timeout=3.0)
+                                        wait_for_registration_submission(page, timeout=POST_CAPTCHA_SUBMISSION_TIMEOUT)
                                     elif captcha_solver_config.fallback_manual:
                                         print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
                                         manual_trace_records = attach_manual_trace_recorder(
@@ -1371,7 +1443,7 @@ def register_qwen(
                                             label=label,
                                             image_dir=IMAGES_DIR,
                                         )
-                                        wait_for_registration_submission(page, timeout=3.0)
+                                        wait_for_registration_submission(page, timeout=POST_CAPTCHA_SUBMISSION_TIMEOUT)
                                     else:
                                         print(f"  ❌ {label_prefix}{solver_result.message}")
                                         return False
@@ -1404,7 +1476,7 @@ def register_qwen(
                                         label=label,
                                         image_dir=IMAGES_DIR,
                                     )
-                                    wait_for_registration_submission(page, timeout=3.0)
+                                    wait_for_registration_submission(page, timeout=POST_CAPTCHA_SUBMISSION_TIMEOUT)
                     finally:
                         print(f"  🪟 {label_prefix}滑块阶段结束，正在最小化窗口", flush=True)
                         minimize_page_window(page, label=label)
@@ -1767,3 +1839,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
