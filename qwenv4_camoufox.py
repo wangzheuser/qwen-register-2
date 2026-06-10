@@ -46,6 +46,7 @@ from qwenv4 import (
     gen_password,
     get_current_ip,
     format_average_success_duration,
+    format_duration_seconds,
     format_success_rate,
     install_aliyun_callback_probe,
     install_aliyun_verify_success_route,
@@ -758,6 +759,7 @@ def main():
 
         summary = AccountRunSummary()
         worker = run_account_subprocess if args.concurrency > 1 else run_single_account
+        batch_started_at = time.perf_counter()
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             futures = submit_account_futures(
                 executor,
@@ -774,6 +776,7 @@ def main():
                         future.cancel()
                     executor.shutdown(wait=False, cancel_futures=True)
                     print("🛑 已停止等待新任务完成，正在关闭已启动的浏览器...")
+        total_duration_seconds = time.perf_counter() - batch_started_at
 
         print(f"\n{'═'*60}")
         success_count = summary.success_count
@@ -781,6 +784,7 @@ def main():
         print(f"📊 成功数: {success_count}/{num_accounts}")
         print(f"📈 成功率: {format_success_rate(success_count, num_accounts)}")
         print(f"⏱️ 平均成功耗时: {format_average_success_duration(summary)}")
+        print(f"⏳ 总耗时: {format_duration_seconds(total_duration_seconds)}")
         print("💾 结果保存到:")
         print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
         print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
@@ -794,4 +798,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -583,6 +583,63 @@ def test_format_average_success_duration_handles_no_success():
 
     assert qwenv4.format_average_success_duration(summary) == "无成功账号"
 
+def test_format_duration_seconds_formats_minutes_and_seconds():
+    assert qwenv4.format_duration_seconds(103) == "1分43秒"
+    assert qwenv4.format_duration_seconds(59.4) == "59秒"
+    assert qwenv4.format_duration_seconds(62.0) == "1分02秒"
+
+
+def _summary_args(**overrides):
+    from types import SimpleNamespace
+
+    values = dict(
+        count=2,
+        email_provider="mailtm",
+        api_proxy=None,
+        browser_proxy=None,
+        concurrency=1,
+        captcha_record_only=False,
+        captcha_solver="manual",
+        captcha_timeout=600,
+        captcha_ai_model="model",
+        captcha_record_trace=False,
+        captcha_replay_trace=None,
+        captcha_drag_backend="playwright",
+        captcha_drag_strategy="human",
+        captcha_target_right_bias=None,
+        captcha_callback_bypass=False,
+        captcha_force_verify_success=False,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1",
+        qwen2api_timeout=30,
+        log_file="",
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_qwenv4_main_prints_total_duration_after_average(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(qwenv4, "parse_args", lambda argv=None: _summary_args())
+    monkeypatch.setattr(qwenv4, "enable_run_logging", lambda *a, **k: SimpleNamespace(path="run.log"))
+    monkeypatch.setattr(qwenv4, "close_run_logging", lambda state: None)
+    monkeypatch.setattr(qwenv4, "start_parent_stop_file_watcher", lambda: None)
+    monkeypatch.setattr(qwenv4, "submit_account_futures", lambda *a, **k: [])
+    monkeypatch.setattr(
+        qwenv4,
+        "collect_account_futures",
+        lambda futures, total: qwenv4.AccountRunSummary(success_count=2, success_durations=[61.0, 63.0]),
+    )
+    ticks = iter([10.0, 113.0])
+    monkeypatch.setattr(qwenv4.time, "perf_counter", lambda: next(ticks))
+
+    qwenv4.main()
+
+    lines = capsys.readouterr().out.splitlines()
+    average_index = lines.index("⏱️ 平均成功耗时: 1分02秒")
+    assert lines[average_index + 1] == "⏳ 总耗时: 1分43秒"
+
 
 def test_stage_timer_prints_account_timing_summary(capsys):
     timer = qwenv4.AccountStageTimer("[账号 1/1]", clock_values=iter([0.0, 1.2, 2.7]))

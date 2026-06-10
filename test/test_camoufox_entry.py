@@ -20,6 +20,51 @@ def test_camoufox_entry_imports_and_reuses_qwenv4_parser():
     assert args.captcha_timeout == 600
     assert qwenv4_camoufox.parse_args is qwenv4.parse_args
 
+def test_camoufox_main_prints_total_duration_after_average(monkeypatch, capsys):
+    from types import SimpleNamespace
+    import qwenv4_camoufox
+
+    args = SimpleNamespace(
+        camoufox_worker=False,
+        count=2,
+        email_provider="mailtm",
+        api_proxy=None,
+        browser_proxy=None,
+        concurrency=1,
+        captcha_solver="manual",
+        captcha_timeout=600,
+        captcha_ai_model="model",
+        captcha_record_trace=False,
+        captcha_replay_trace=None,
+        captcha_drag_backend="playwright",
+        captcha_drag_strategy="human",
+        captcha_target_right_bias=None,
+        captcha_callback_bypass=False,
+        captcha_force_verify_success=False,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1",
+        qwen2api_timeout=30,
+        log_file="",
+    )
+    monkeypatch.setattr(qwenv4_camoufox, "parse_args", lambda argv=None: args)
+    monkeypatch.setattr(qwenv4_camoufox, "enable_run_logging", lambda *a, **k: SimpleNamespace(path="run.log"))
+    monkeypatch.setattr(qwenv4_camoufox, "close_run_logging", lambda state: None)
+    monkeypatch.setattr(qwenv4_camoufox, "start_parent_stop_file_watcher", lambda: None)
+    monkeypatch.setattr(qwenv4_camoufox, "submit_account_futures", lambda *a, **k: [])
+    monkeypatch.setattr(
+        qwenv4_camoufox,
+        "collect_account_futures",
+        lambda futures, total: qwenv4_camoufox.AccountRunSummary(success_count=2, success_durations=[61.0, 63.0]),
+    )
+    ticks = iter([10.0, 113.0])
+    monkeypatch.setattr(qwenv4_camoufox.time, "perf_counter", lambda: next(ticks))
+
+    qwenv4_camoufox.main()
+
+    lines = capsys.readouterr().out.splitlines()
+    average_index = lines.index("⏱️ 平均成功耗时: 1分02秒")
+    assert lines[average_index + 1] == "⏳ 总耗时: 1分43秒"
+
 
 def test_camoufox_account_timeout_default_allows_slow_verification_cleanup(monkeypatch):
     import qwenv4_camoufox
