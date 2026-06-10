@@ -35,6 +35,15 @@ class ForegroundFocusResult:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class TopmostLease:
+    ok: bool
+    hwnd: Optional[int] = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 def ensure_page_foreground(
     page: Any,
     *,
@@ -78,7 +87,7 @@ def ensure_page_topmost_foreground(
 
 
 @contextmanager
-def hold_page_topmost(page: Any, *, label: str = "") -> Iterator[bool]:
+def hold_page_topmost(page: Any, *, label: str = "") -> Iterator[TopmostLease]:
     """滑块阶段置顶租约：进入时强制置顶，退出时取消置顶。"""
     prefix = f"{label} " if label else ""
     hwnd: Optional[int] = None
@@ -90,7 +99,7 @@ def hold_page_topmost(page: Any, *, label: str = "") -> Iterator[bool]:
             print(f"  ✅ {prefix}滑块窗口前台置顶确认成功（非 Windows 降级）", flush=True)
         else:
             print(f"  ❌ {prefix}滑块窗口前台置顶确认失败（非 Windows 降级）", flush=True)
-        yield ok
+        yield TopmostLease(ok=ok, hwnd=None)
         return
 
     marker = f"qwen-topmost-hold-{uuid.uuid4().hex}"
@@ -101,12 +110,24 @@ def hold_page_topmost(page: Any, *, label: str = "") -> Iterator[bool]:
         hwnd = _find_hwnd_for_page(page, marker, allow_metrics_fallback=True)
         if not hwnd:
             print(f"  ❌ {prefix}滑块窗口前台置顶确认失败：未找到浏览器窗口", flush=True)
-            yield False
+            yield TopmostLease(ok=False, hwnd=None)
             return
 
-        _activate_hwnd(int(hwnd), keep_topmost=True)
-        time.sleep(0.2)
-        ok = _foreground_matches(int(hwnd))
+        ok = False
+        attempts = max(1, int(os.getenv("CAPTCHA_TOPMOST_HOLD_ATTEMPTS", "5") or "5"))
+        for attempt in range(1, attempts + 1):
+            _try_playwright_focus(page)
+            _activate_hwnd(int(hwnd), keep_topmost=True)
+            time.sleep(0.12 if attempt < attempts else 0.2)
+            ok = _foreground_matches(int(hwnd))
+            if ok:
+                break
+            if attempt < attempts:
+                print(
+                    f"  ⚠️ {prefix}滑块窗口前台置顶确认失败 "
+                    f"({attempt}/{attempts}) hwnd={int(hwnd)} foreground={_get_foreground_hwnd()}，正在重试",
+                    flush=True,
+                )
         if ok:
             print(f"  ✅ {prefix}滑块窗口已强制置顶 hwnd={int(hwnd)}", flush=True)
             print(f"  ✅ {prefix}滑块窗口前台置顶确认成功", flush=True)
@@ -116,7 +137,7 @@ def hold_page_topmost(page: Any, *, label: str = "") -> Iterator[bool]:
                 f"hwnd={int(hwnd)} foreground={_get_foreground_hwnd()}",
                 flush=True,
             )
-        yield ok
+        yield TopmostLease(ok=ok, hwnd=int(hwnd))
     finally:
         if hwnd:
             print(f"  🪟 {prefix}滑块阶段结束，正在取消置顶", flush=True)
@@ -203,7 +224,7 @@ def _ensure_page_foreground(
         _restore_page_focus_marker(page)
 
 
-def minimize_page_window(page: Any, *, label: str = "") -> bool:
+def minimize_page_window(page: Any, *, label: str = "", hwnd: Optional[int] = None) -> bool:
     """最小化 Playwright 页面对应的顶层浏览器窗口。
 
     该函数用于滑块阶段结束后释放 Windows 前台资源。它不会调用
@@ -212,6 +233,19 @@ def minimize_page_window(page: Any, *, label: str = "") -> bool:
     prefix = f"{label} " if label else ""
     if os.name != "nt":
         print(f"  ⚠️ {prefix}滑块窗口最小化跳过：非 Windows 环境", flush=True)
+        return False
+
+    if hwnd:
+        try:
+            _clear_hwnd_topmost(int(hwnd))
+            ok = bool(_get_user32().ShowWindow(int(hwnd), SW_MINIMIZE))
+        except Exception as exc:
+            print(f"  ⚠️ {prefix}滑块窗口最小化失败/跳过: {exc}", flush=True)
+            return False
+        if ok:
+            print(f"  ✅ {prefix}滑块窗口已最小化", flush=True)
+            return True
+        print(f"  ⚠️ {prefix}滑块窗口最小化失败/跳过：ShowWindow 返回失败", flush=True)
         return False
 
     marker = f"qwen-minimize-{uuid.uuid4().hex}"

@@ -27,6 +27,7 @@ from email_providers.store import UsedEmailsStore
 from qwenv4 import (
     AccountRunResult,
     AccountRunSummary,
+    AccountStageTimer,
     HEADLESS,
     IMAGES_DIR,
     OUTPUT_FILE_JSON,
@@ -50,6 +51,8 @@ from qwenv4 import (
     install_aliyun_verify_success_route,
     is_generator_provider,
     maybe_sync_account_to_qwen2api,
+    maybe_sync_account_to_qwen2api_async,
+    flush_qwen2api_async_sync,
     parse_args,
     positive_int,
     register_qwen,
@@ -98,16 +101,22 @@ def _camoufox_launch_kwargs(proxy_dict):
 def wait_for_camoufox_start_slot(label, *, stop_event=None, file_lock_timeout=0.5):
     """父进程启动 Camoufox worker 前短探测前台资源是否空闲。
 
-    该函数只用于节流新 worker 启动，不能在滑块 intent 存在时长时间占住父进程
-    window 队列。若短时间内检测到滑块正在占用前台，返回 False，让调度循环稍后
-    重试；真正的滑块/窗口串行仍由子进程内部锁兜底。
+    该函数只用于节流新 worker 启动。Camoufox 启动会创建/激活窗口；真实
+    并发日志显示它可能在 slider 持锁拖动期间抢前台，导致 OS 鼠标拖到错误
+    窗口。因此这里不持有跨进程文件锁，但会短暂等待 slider intent 清除后
+    再放行新 worker 预热。
     """
     from captcha_solvers.slider_lock import SliderLockTimeout
 
-    if _camoufox_slider_intent_active():
-        return False
-
     try:
+        wait_started = time.monotonic()
+        while _camoufox_slider_intent_active():
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                return False
+            if time.monotonic() - wait_started >= float(file_lock_timeout):
+                return False
+            if not sleep_interruptible(0.1):
+                return False
         with acquire_foreground_window_lock(
             label=f"{label} worker 启动槽",
             stop_event=stop_event,
@@ -233,6 +242,24 @@ def _terminate_process_tree(process, label):
         print(f"  ⚠️ {label} 终止 Camoufox worker 子进程失败: {e}", flush=True)
 
 
+def _camoufox_stage_idle_timeout(stage: str, default_timeout: float) -> float:
+    """按子进程阶段返回更细粒度空闲超时，避免 new_page 卡死等满账号总超时。"""
+    normalized = (stage or "").strip().lower()
+    env_map = {
+        "new_page": ("CAMOUFOX_STAGE_NEW_PAGE_IDLE_TIMEOUT", 20.0),
+        "launch": ("CAMOUFOX_STAGE_LAUNCH_IDLE_TIMEOUT", 45.0),
+    }
+    if normalized not in env_map:
+        return float(default_timeout)
+    env_name, default_value = env_map[normalized]
+    try:
+        value = float(os.getenv(env_name, str(default_value)))
+    except Exception:
+        value = default_value
+    value = max(1.0, value)
+    return min(float(default_timeout), value)
+
+
 def run_account_subprocess(account_index, total_accounts, args, proxy_str=None, timeout_seconds=None):
     """用独立 Python 子进程执行一个 Camoufox 账号，隔离 Camoufox driver 卡死。"""
     started_at = time.perf_counter()
@@ -273,6 +300,7 @@ def run_account_subprocess(account_index, total_accounts, args, proxy_str=None, 
             process = None
             reader = None
             last_output_at = {"value": time.monotonic()}
+            child_stage = {"value": ""}
             process = subprocess.Popen(
                 command,
                 cwd=str(Path(__file__).resolve().parent),
@@ -293,6 +321,23 @@ def run_account_subprocess(account_index, total_accounts, args, proxy_str=None, 
                             with child_result_lock:
                                 last_output_at["value"] = time.monotonic()
                             clean_line = line.rstrip("\r\n")
+                            if "Camoufox 启动 已获得 Camoufox 运行时锁" in clean_line:
+                                with child_result_lock:
+                                    child_stage["value"] = "launch"
+                            elif "新建注册页 已获得 Camoufox 运行时锁" in clean_line:
+                                with child_result_lock:
+                                    child_stage["value"] = "new_page"
+                            elif any(
+                                marker_text in clean_line
+                                for marker_text in (
+                                    "已配置浏览器代理，跳过本机 IP 检测",
+                                    "当前 IP:",
+                                    "邮箱:",
+                                    "注册流程 已获得 Camoufox 运行时锁",
+                                )
+                            ):
+                                with child_result_lock:
+                                    child_stage["value"] = ""
                             if clean_line.startswith(marker):
                                 try:
                                     parsed = json.loads(clean_line[len(marker):])
@@ -323,7 +368,9 @@ def run_account_subprocess(account_index, total_accounts, args, proxy_str=None, 
                 now = time.monotonic()
                 with child_result_lock:
                     idle_seconds = now - float(last_output_at.get("value", now))
-                if idle_seconds >= timeout:
+                    stage = str(child_stage.get("value") or "")
+                effective_timeout = _camoufox_stage_idle_timeout(stage, timeout)
+                if idle_seconds >= effective_timeout:
                     timed_out = True
                     with child_result_lock:
                         child_success_seen = bool(child_result.get("success"))
@@ -333,9 +380,21 @@ def run_account_subprocess(account_index, total_accounts, args, proxy_str=None, 
                             f"  ⏰ {label} 已保存成功但子进程未及时退出，正在终止清理残留进程",
                             flush=True,
                         )
+                    elif stage == "new_page":
+                        print(
+                            f"  ⏰ {label} 新建注册页阶段无输出超时 {int(effective_timeout)}s，"
+                            f"正在终止当前账号子进程",
+                            flush=True,
+                        )
+                    elif stage == "launch":
+                        print(
+                            f"  ⏰ {label} Camoufox 启动阶段无输出超时 {int(effective_timeout)}s，"
+                            f"正在终止当前账号子进程",
+                            flush=True,
+                        )
                     else:
                         print(
-                            f"  ⏰ {label} Camoufox worker 无输出超时 {int(timeout)}s，"
+                            f"  ⏰ {label} Camoufox worker 无输出超时 {int(effective_timeout)}s，"
                             f"正在终止当前账号子进程",
                             flush=True,
                         )
@@ -396,10 +455,17 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
     """执行单个账号注册任务；每个线程独立创建 Camoufox 实例。"""
     started_at = time.perf_counter()
 
+    label = f"[账号 {account_index}/{total_accounts}]"
+    stage_timer = AccountStageTimer(label)
+    summary_printed = False
+
     def result(success):
+        nonlocal summary_printed
+        if not summary_printed:
+            stage_timer.print_summary(success=bool(success))
+            summary_printed = True
         return AccountRunResult(success=success, duration_seconds=time.perf_counter() - started_at)
 
-    label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
     print(f"🦊 {label} Camoufox")
     print(f"{'═'*60}")
@@ -409,6 +475,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
     except ValueError as e:
         print(f"  ❌ {label} {e}")
         return result(False)
+    stage_timer.mark("代理解析")
     proxy_dict = proxy_info["proxy"]
     if proxy_dict:
         print(f"  🌐 {label} 浏览器代理: {proxy_info['display']}")
@@ -430,6 +497,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                 with acquire_foreground_window_lock(label=f"{label} Camoufox 启动", stop_event=STOP_EVENT):
                     browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
                     browser = browser_cm.__enter__()
+                stage_timer.mark("浏览器启动")
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")
@@ -443,7 +511,8 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     # 滑块阶段仍会通过 slider 文件锁 + Windows 置顶重新获取前台。
                     qwen = browser.new_page(viewport=CAMOUFOX_VIEWPORT)
                     context = qwen.context
-                    install_aliyun_callback_probe(qwen)
+                stage_timer.mark("新建页面")
+                install_aliyun_callback_probe(qwen)
 
                 if getattr(args, "browser_proxy", "") or proxy_str:
                     current_ip, country = "unknown", "unknown"
@@ -458,6 +527,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     api_proxy=args.api_proxy,
                     context=context,
                 )
+                stage_timer.mark("邮箱 Provider")
 
                 used_emails_store = UsedEmailsStore("used_emails.json")
                 max_email_retries = 1 if isinstance(provider, GeneratorEmailProvider) else 3
@@ -473,6 +543,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
 
                 if not email:
                     raise EmailCreationError("多次创建邮箱均重复，跳过当前账号")
+                stage_timer.mark("邮箱创建")
 
                 first_name = gen_first_name()
                 password = gen_password()
@@ -495,11 +566,13 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                         captcha_solver_config=build_captcha_solver_config(args),
                         label=label,
                     )
+                stage_timer.mark("滑块/注册")
                 if not registered:
                     print(f"  ❌ {label} 注册失败，跳过...")
                     return result(False)
 
                 verify_url = provider.get_activation_link(timeout=300)
+                stage_timer.mark("邮箱激活")
 
                 with acquire_camoufox_runtime_lock(f"{label} 验证与令牌提取"):
                     print(f"  🔄 {label} 正在打开验证链接...")
@@ -507,11 +580,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
 
                     print(f"  🔑 {label} 正在提取认证令牌...")
                     tokens = wait_for_token_extraction(qwen, timeout=5.0)
-
-                    try:
-                        qwen.screenshot(path=f"{IMAGES_DIR}/qwen_verified_{account_index}.png")
-                    except Exception as e:
-                        print(f"  ⚠️ {label} 截图失败，已忽略，不影响账号保存: {e}")
+                    stage_timer.mark("验证与令牌")
 
                     if tokens["token"]:
                         print(f"  ✅ {label} 已提取认证令牌: {tokens['token'][:80]}...")
@@ -532,16 +601,22 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     device_id=tokens.get("device_id"),
                     user_role=tokens.get("user_role", "user"),
                 )
-                maybe_sync_account_to_qwen2api(
+                maybe_sync_account_to_qwen2api_async(
                     email=email,
                     password=password,
                     token=tokens.get("token"),
                     config=build_qwen2api_sync_config(args),
                     label=label,
                 )
+                stage_timer.mark("保存/同步提交")
 
-                print(f"  ✅ {label} 已验证并保存！")
-                return result(True)
+                print(f"  ✅ {label} 已验证并保存！", flush=True)
+                success_result = result(True)
+                try:
+                    qwen.screenshot(path=f"{IMAGES_DIR}/qwen_verified_{account_index}.png")
+                except Exception as e:
+                    print(f"  ⚠️ {label} 截图失败，已忽略，不影响账号保存: {e}")
+                return success_result
 
             except EmailProviderError as e:
                 print(f"  ❌ {label} 邮箱服务错误: {e}")
@@ -709,6 +784,9 @@ def main():
         print("💾 结果保存到:")
         print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
         print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
+        if args.sync_qwen2api:
+            print("🔁 正在等待 qwen2API 后台同步完成...")
+            flush_qwen2api_async_sync(timeout=max(1, int(args.qwen2api_timeout)))
         print(f"{'═'*60}")
     finally:
         close_run_logging(logging_state)
@@ -716,3 +794,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

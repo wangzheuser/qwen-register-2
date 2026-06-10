@@ -18,6 +18,7 @@ images/probe_os/
 images/probe_root_loaded.png
 images/debug_*.png
 images/captcha_ai_*.png
+images/captcha_ai_*.json
 images/*manual_trace*.json
 test/.playwright-mcp/
 test/debug_images/

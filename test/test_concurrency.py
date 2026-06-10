@@ -584,6 +584,19 @@ def test_format_average_success_duration_handles_no_success():
     assert qwenv4.format_average_success_duration(summary) == "无成功账号"
 
 
+def test_stage_timer_prints_account_timing_summary(capsys):
+    timer = qwenv4.AccountStageTimer("[账号 1/1]", clock_values=iter([0.0, 1.2, 2.7]))
+
+    timer.mark("邮箱创建")
+    timer.mark("滑块处理")
+    timer.print_summary(success=True)
+
+    out = capsys.readouterr().out
+    assert "[账号 1/1] 耗时拆分" in out
+    assert "邮箱创建: 1.2s" in out
+    assert "滑块处理: 1.5s" in out
+
+
 def test_wait_for_registration_submission_returns_as_soon_as_success(monkeypatch):
     class Page:
         def __init__(self):
@@ -644,3 +657,31 @@ def test_request_shutdown_forces_exit_after_short_grace(monkeypatch):
     finally:
         qwenv4.STOP_EVENT.clear()
         qwenv4.INTERRUPT_COUNT = 0
+
+
+
+def test_maybe_sync_account_to_qwen2api_async_submits_without_blocking(monkeypatch):
+    from integrations.qwen2api import Qwen2ApiSyncConfig
+
+    submitted = []
+
+    class FakeSyncer:
+        def submit(self, **kwargs):
+            submitted.append(kwargs)
+            return "future-1"
+
+    monkeypatch.setattr(qwenv4, "QWEN2API_ASYNC_SYNCER", FakeSyncer())
+
+    result = qwenv4.maybe_sync_account_to_qwen2api_async(
+        email="user@example.com",
+        password="Password1!",
+        token="token-123",
+        config=Qwen2ApiSyncConfig(enabled=True, base_url="http://127.0.0.1:7860", admin_key="secret"),
+        label="[账号 1/1]",
+    )
+
+    assert result is True
+    assert submitted[0]["email"] == "user@example.com"
+    assert submitted[0]["token"] == "token-123"
+    assert submitted[0]["config"].admin_key == "secret"
+

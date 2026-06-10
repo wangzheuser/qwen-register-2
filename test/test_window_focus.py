@@ -181,12 +181,156 @@ def test_hold_page_topmost_keeps_topmost_until_context_exit(monkeypatch):
     page = Page()
 
     with window_focus.hold_page_topmost(page, label="[测试]") as ok:
-        assert ok is True
+        assert ok
         assert (4321, window_focus.HWND_TOPMOST, window_focus.SWP_NOMOVE | window_focus.SWP_NOSIZE | window_focus.SWP_SHOWWINDOW) in user32.pos_calls
         assert all(call[1] != window_focus.HWND_NOTOPMOST for call in user32.pos_calls)
 
     assert user32.pos_calls[-1] == (4321, window_focus.HWND_NOTOPMOST, window_focus.SWP_NOMOVE | window_focus.SWP_NOSIZE)
     assert page.restored == 1
+
+
+def test_hold_page_topmost_exposes_hwnd_for_fast_minimize(monkeypatch):
+    from captcha_solvers import window_focus
+
+    class User32:
+        def ShowWindow(self, hwnd, command):
+            return 1
+
+        def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+            return 1
+
+        def BringWindowToTop(self, hwnd):
+            return 1
+
+        def GetForegroundWindow(self):
+            return 4321
+
+        def GetWindowThreadProcessId(self, hwnd, pid):
+            return 99
+
+        def AttachThreadInput(self, current_thread, other_thread, attach):
+            return 1
+
+        def SetActiveWindow(self, hwnd):
+            return 1
+
+        def SetFocus(self, hwnd):
+            return 1
+
+        def SetForegroundWindow(self, hwnd):
+            return 1
+
+    class Page:
+        def bring_to_front(self):
+            pass
+
+        def evaluate(self, script, arg=None):
+            return True
+
+    monkeypatch.setattr(window_focus.os, "name", "nt", raising=False)
+    monkeypatch.setattr(window_focus, "_get_user32", lambda: User32())
+    monkeypatch.setattr(window_focus, "_find_hwnd_for_page", lambda _page, _marker, **_kwargs: 4321)
+    monkeypatch.setattr(window_focus, "_foreground_matches", lambda hwnd: hwnd == 4321)
+
+    page = Page()
+
+    with window_focus.hold_page_topmost(page, label="[测试]") as lease:
+        assert lease
+        assert lease.hwnd == 4321
+
+
+def test_hold_page_topmost_retries_until_foreground_matches(monkeypatch):
+    from captcha_solvers import window_focus
+
+    class User32:
+        def __init__(self):
+            self.pos_calls = []
+
+        def ShowWindow(self, hwnd, command):
+            return 1
+
+        def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+            self.pos_calls.append((hwnd, insert_after, flags))
+            return 1
+
+        def BringWindowToTop(self, hwnd):
+            return 1
+
+        def GetForegroundWindow(self):
+            return 9999
+
+        def GetWindowThreadProcessId(self, hwnd, pid):
+            return 99
+
+        def AttachThreadInput(self, current_thread, other_thread, attach):
+            return 1
+
+        def SetActiveWindow(self, hwnd):
+            return 1
+
+        def SetFocus(self, hwnd):
+            return 1
+
+        def SetForegroundWindow(self, hwnd):
+            return 1
+
+    class Page:
+        def bring_to_front(self):
+            pass
+
+        def evaluate(self, script, arg=None):
+            return True
+
+    calls = {"match": 0}
+
+    def fake_match(hwnd):
+        calls["match"] += 1
+        return calls["match"] >= 3
+
+    user32 = User32()
+    monkeypatch.setattr(window_focus.os, "name", "nt", raising=False)
+    monkeypatch.setattr(window_focus, "_get_user32", lambda: user32)
+    monkeypatch.setattr(window_focus, "_find_hwnd_for_page", lambda _page, _marker, **_kwargs: 4321)
+    monkeypatch.setattr(window_focus, "_foreground_matches", fake_match)
+    monkeypatch.setattr(window_focus.time, "sleep", lambda _seconds: None)
+
+    with window_focus.hold_page_topmost(Page(), label="[测试]") as lease:
+        assert lease
+        assert lease.hwnd == 4321
+
+    assert calls["match"] == 3
+    topmost_calls = [call for call in user32.pos_calls if call[1] == window_focus.HWND_TOPMOST]
+    assert len(topmost_calls) >= 3
+
+
+def test_minimize_page_window_accepts_existing_hwnd_without_marker_lookup(monkeypatch):
+    from captcha_solvers import window_focus
+
+    class User32:
+        def __init__(self):
+            self.show_calls = []
+            self.pos_calls = []
+
+        def ShowWindow(self, hwnd, command):
+            self.show_calls.append((hwnd, command))
+            return 1
+
+        def SetWindowPos(self, hwnd, insert_after, x, y, cx, cy, flags):
+            self.pos_calls.append((hwnd, insert_after, flags))
+            return 1
+
+    class Page:
+        def evaluate(self, script, arg=None):
+            raise AssertionError("已有 hwnd 时不应再通过页面标题 marker 定位窗口")
+
+    user32 = User32()
+    monkeypatch.setattr(window_focus.os, "name", "nt", raising=False)
+    monkeypatch.setattr(window_focus, "_get_user32", lambda: user32)
+    monkeypatch.setattr(window_focus, "_find_hwnd_for_page", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应查找窗口")))
+
+    assert window_focus.minimize_page_window(Page(), label="[测试]", hwnd=4321) is True
+    assert user32.pos_calls == [(4321, window_focus.HWND_NOTOPMOST, window_focus.SWP_NOMOVE | window_focus.SWP_NOSIZE)]
+    assert user32.show_calls == [(4321, window_focus.SW_MINIMIZE)]
 
 
 def test_configure_user32_api_sets_set_window_pos_hwnd_prototype():

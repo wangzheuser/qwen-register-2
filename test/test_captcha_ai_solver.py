@@ -517,6 +517,85 @@ def test_solve_slider_captcha_passes_local_playwright_slider(tmp_path):
             browser.close()
 
 
+
+def test_read_page_body_text_retries_transient_null_body(monkeypatch):
+    calls = {"evaluate": 0}
+    sleeps = []
+
+    class Page:
+        def evaluate(self, script):
+            assert "document.body ? document.body.innerText : ''" in script
+            calls["evaluate"] += 1
+            if calls["evaluate"] == 1:
+                raise RuntimeError("Page.evaluate: document.body is null")
+            return "pending activation verification email"
+
+    now = {"value": 0.0}
+    monkeypatch.setattr(qwenv4.time, "monotonic", lambda: now["value"])
+
+    def fake_sleep(seconds, stop_event=None):
+        sleeps.append(float(seconds))
+        now["value"] += float(seconds)
+        return True
+
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", fake_sleep)
+
+    assert qwenv4.read_page_body_text(Page(), timeout=1.0, interval=0.2) == "pending activation verification email"
+    assert calls["evaluate"] == 2
+    assert sleeps == [pytest.approx(0.2)]
+
+
+def test_register_qwen_treats_transient_null_body_after_slider_as_submitted(monkeypatch):
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, CaptchaSolverResult
+
+    calls = {"body": 0}
+
+    class Page:
+        def evaluate(self, script, *args):
+            if "document.body" in script:
+                calls["body"] += 1
+                if calls["body"] == 1:
+                    raise RuntimeError("Page.evaluate: document.body is null")
+                return "pending activation verification email"
+            return ""
+
+    class FakeSliderLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTopmost:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    now = {"value": 0.0}
+    monkeypatch.setattr(qwenv4.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", lambda seconds, stop_event=None: now.__setitem__("value", now["value"] + float(seconds)) or True)
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "captcha")
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", lambda *args, **kwargs: CaptchaSolverResult(ok=True, message="ok"))
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda *args, **kwargs: True, raising=False)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, fallback_manual=False),
+    ) is True
+    assert calls["body"] >= 2
+
 def test_register_qwen_ai_failure_can_skip_manual(monkeypatch):
     class DummyLocator:
         def scroll_into_view_if_needed(self):
@@ -1087,6 +1166,28 @@ def test_calculate_aliyun_local_adjustment_uses_current_puzzle_left():
 
 
 
+def test_target_alternatives_prioritize_right_template_when_white_matches_ocr():
+    from captcha_solvers.ai_slider import _target_x_alternatives
+
+    alternatives = _target_x_alternatives(
+        chosen=207.0,
+        image_width=300.0,
+        ddddocr_x=206.5,
+        white_gap_x=207.0,
+        match_x=244.0,
+    )
+
+    assert alternatives[:2] == [207.0, 244.0]
+
+
+def test_initial_failure_wait_default_is_short_for_fast_retry(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.delenv("CAPTCHA_INITIAL_FAILURE_WAIT_SECONDS", raising=False)
+
+    assert ai_slider._captcha_initial_failure_wait_seconds() == pytest.approx(1.7)
+
+
 def test_ddddocr_plan_uses_slide_match_result(monkeypatch):
     from captcha_solvers import ai_slider
 
@@ -1413,6 +1514,22 @@ def test_prefers_local_right_candidates_when_ddddocr_is_left_false_positive():
     assert source == "图像匹配校准"
 
 
+
+
+def test_prefers_template_when_ddddocr_is_near_left_edge_even_if_template_is_close():
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=73.5,
+        white_gap_x=None,
+        match_x=100,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(100)
+    assert source == "图像匹配校准"
+
+
 def test_prefers_template_when_ddddocr_matches_left_slider_piece():
     from captcha_solvers import ai_slider
 
@@ -1425,6 +1542,115 @@ def test_prefers_template_when_ddddocr_matches_left_slider_piece():
 
     assert target == pytest.approx(197)
     assert source == "图像匹配校准"
+
+
+def test_keeps_ddddocr_when_only_template_conflicts_without_white_gap():
+    """真实运行显示无 white_gap 时盲目切到模板会明显拉低一次通过率。"""
+
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=215.5,
+        white_gap_x=None,
+        match_x=169,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(215.5)
+    assert source == "ddddocr"
+
+
+def test_keeps_high_ddddocr_when_template_is_far_left_without_white_gap():
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=214.5,
+        white_gap_x=None,
+        match_x=94,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(214.5)
+    assert source == "ddddocr"
+
+
+def test_prefers_ddddocr_when_template_conflict_is_too_close_to_edge():
+    """模板匹配落在极左边缘时更像误检，不应覆盖中右部 ddddocr。"""
+
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=235.5,
+        white_gap_x=None,
+        match_x=10,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(235.5)
+    assert source == "ddddocr"
+
+
+
+
+
+
+def test_prefers_white_gap_for_left_mid_self_match_even_when_gap_is_slightly_farther():
+    """真实 Camoufox 样本：ddddocr/template 聚在左中部，white_gap 右移约 44px 时也应优先缺口。"""
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=144.5,
+        white_gap_x=188,
+        match_x=144,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(188)
+    assert source == "图像匹配校准"
+
+
+def test_prefers_white_gap_when_ddddocr_and_template_cluster_left_of_gap():
+    """真实 Camoufox 样本：ddddocr/template 同在左侧时可能是拼图自匹配，应优先白色缺口。"""
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=138.5,
+        white_gap_x=174,
+        match_x=139,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(174)
+    assert source == "图像匹配校准"
+
+
+def test_prefers_white_gap_when_ddddocr_is_near_left_edge_even_if_template_supports_it():
+    """真实 Camoufox 样本：ddddocr 贴近左侧下限且模板也在左侧时，先试白色缺口可少浪费重试。"""
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=74.5,
+        white_gap_x=224,
+        match_x=82,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(224)
+    assert source == "图像匹配校准"
+
+
+def test_prefers_ddddocr_when_template_supports_it_and_white_gap_is_far_right():
+    from captcha_solvers import ai_slider
+
+    target, source = ai_slider._choose_aliyun_target_x(
+        ddddocr_x=197.5,
+        white_gap_x=239,
+        match_x=196,
+        image_width=296,
+    )
+
+    assert target == pytest.approx(197.5)
+    assert source == "ddddocr"
 
 
 def test_prefers_white_gap_when_ddddocr_and_template_are_left_false_positive():
@@ -1565,6 +1791,29 @@ def test_wait_for_captcha_ready_treats_visit_verification_without_images_as_load
             return {"ready": False, "aliyun": True, "reason": "Aliyun 验证码图片加载中"}
 
     now = {"value": 100.0}
+
+    def fake_time():
+        now["value"] += 0.05
+        return now["value"]
+
+    monkeypatch.setattr(ai_slider.time, "time", fake_time)
+    monkeypatch.setattr(ai_slider, "_sleep", lambda _seconds, _stop_event=None: None)
+
+    assert ai_slider._wait_for_captcha_ready(Page(), timeout=0.2) is False
+
+
+
+
+
+def test_wait_for_captcha_ready_treats_access_verification_without_images_as_loading(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    class Page:
+        def evaluate(self, script):
+            assert "Access Verification" in script
+            return {"ready": False, "aliyun": True, "reason": "Aliyun 验证码图片加载中"}
+
+    now = {"value": 200.0}
 
     def fake_time():
         now["value"] += 0.05
@@ -2591,6 +2840,62 @@ def test_target_x_alternatives_try_near_template_before_far_white_gap():
     assert alternatives[:3] == pytest.approx([194.5, 200.0, 240.0])
 
 
+
+
+def test_solve_slider_captcha_rechecks_disappeared_captcha_before_next_attempt(tmp_path, monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.setenv("CAPTCHA_TARGET_RIGHT_BIAS", "0")
+
+    class Root:
+        pass
+
+    calls = {"perform": 0, "solved": 0}
+    monkeypatch.setattr(ai_slider, "_find_captcha_root", lambda _page: Root())
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ai_slider, "_screenshot_locator", lambda _root, path: Path(path).write_bytes(b"fake"))
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_success", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ai_slider.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ai_slider, "_sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ai_slider, "_build_drag_plan", lambda *_args: {
+        "start_x": 10.0,
+        "start_y": 20.0,
+        "distance": 194.5,
+        "max_distance": 296.0,
+        "calibrate_target_x": 194.5,
+        "target_scale": 1.0,
+        "target_x_alternatives": [194.5, 200.0, 240.0],
+        "source": "ddddocr",
+    })
+
+    def fake_perform(_page, plan):
+        calls["perform"] += 1
+        plan["hold_state"] = {
+            "sliderLeft": float(plan["calibrate_target_x"]),
+            "puzzleLeft": float(plan["calibrate_target_x"]),
+            "sliderBoxX": 500.0,
+            "puzzleBoxX": 500.0 + float(plan["calibrate_target_x"]),
+        }
+        return float(plan["distance"])
+
+    def fake_solved(_page):
+        calls["solved"] += 1
+        return calls["solved"] >= 2
+
+    monkeypatch.setattr(ai_slider, "_perform_drag", fake_perform)
+    monkeypatch.setattr(ai_slider, "_captcha_solved", fake_solved)
+
+    result = solve_slider_captcha(
+        object(),
+        CaptchaSolverConfig(enabled=True, attempts=3, mode="ddddocr"),
+        image_dir=str(tmp_path),
+    )
+
+    assert result.ok is True
+    assert result.attempts == 1
+    assert calls["perform"] == 1
+
+
 def test_solve_slider_captcha_rotates_target_x_alternatives_across_retries(tmp_path, monkeypatch):
     from captcha_solvers import ai_slider
 
@@ -2616,6 +2921,70 @@ def test_solve_slider_captcha_rotates_target_x_alternatives_across_retries(tmp_p
         "target_x_alternatives": [194.5, 200.0, 240.0],
         "source": "ddddocr",
     })
+
+    def fake_perform(_page, plan):
+        attempted_targets.append(float(plan["calibrate_target_x"]))
+        plan["hold_state"] = {
+            "sliderLeft": float(plan["calibrate_target_x"]),
+            "puzzleLeft": float(plan["calibrate_target_x"]),
+            "sliderBoxX": 500.0,
+            "puzzleBoxX": 500.0 + float(plan["calibrate_target_x"]),
+        }
+        return float(plan["distance"])
+
+    monkeypatch.setattr(ai_slider, "_perform_drag", fake_perform)
+
+    result = solve_slider_captcha(
+        object(),
+        CaptchaSolverConfig(enabled=True, attempts=3, mode="ddddocr"),
+        image_dir=str(tmp_path),
+    )
+
+    assert result.ok is False
+    assert attempted_targets == pytest.approx([194.5, 200.0, 240.0])
+
+
+def test_solve_slider_captcha_rotates_original_targets_when_detection_jitters(tmp_path, monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.setenv("CAPTCHA_TARGET_RIGHT_BIAS", "0")
+
+    class Root:
+        pass
+
+    plans = [
+        [194.5, 200.0, 240.0],
+        [194.8, 201.0, 241.0],
+        [194.2, 199.0, 239.0],
+    ]
+    attempted_targets = []
+    build_calls = {"count": 0}
+    monkeypatch.setattr(ai_slider, "_find_captcha_root", lambda _page: Root())
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ai_slider, "_screenshot_locator", lambda _root, path: Path(path).write_bytes(b"fake"))
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_success", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ai_slider.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ai_slider, "_sleep", lambda *_args, **_kwargs: None)
+
+    def fake_build_drag_plan(*_args):
+        index = min(build_calls["count"], len(plans) - 1)
+        build_calls["count"] += 1
+        alternatives = plans[index]
+        return {
+            "start_x": 10.0,
+            "start_y": 20.0,
+            "distance": alternatives[0],
+            "max_distance": 296.0,
+            "calibrate_target_x": alternatives[0],
+            "target_scale": 1.0,
+            "target_x_alternatives": alternatives,
+            "source": "ddddocr",
+            "ddddocr_target_x": alternatives[0],
+            "white_gap_target_x": None,
+            "match_target_x": alternatives[1],
+        }
+
+    monkeypatch.setattr(ai_slider, "_build_drag_plan", fake_build_drag_plan)
 
     def fake_perform(_page, plan):
         attempted_targets.append(float(plan["calibrate_target_x"]))
@@ -2833,6 +3202,27 @@ def test_solve_slider_captcha_focus_miss_does_not_consume_config_attempts(tmp_pa
     assert result.ok is True
     assert drag_calls == pytest.approx([180.0, 180.0, 180.0])
     assert refresh_calls == []
+
+
+def test_drag_track_anomaly_is_treated_as_focus_miss():
+    from captcha_solvers import ai_slider
+
+    assert ai_slider._is_focus_miss_drag_exception(
+        RuntimeError("OS 鼠标轨迹异常: x=100.0, y=86.0, 允许范围 x=[470.0,900.0] y=[370.8,730.8]"),
+        {},
+    ) is True
+
+
+def test_zero_motion_state_with_missing_puzzle_box_is_focus_miss():
+    """真实日志样本：sliderLeft/puzzleLeft 都为 0 且 puzzleBoxX=0，应快速重试而不是等待判定失败。"""
+    from captcha_solvers import ai_slider
+
+    assert ai_slider._motion_state_looks_focus_missed({
+        "sliderLeft": 0.0,
+        "puzzleLeft": 0.0,
+        "sliderBoxX": 490.0,
+        "puzzleBoxX": 0.0,
+    }) is True
 
 
 def test_default_target_bias_compensates_observed_right_overshoot(monkeypatch):
@@ -3060,6 +3450,22 @@ def test_drag_debug_artifacts_can_be_enabled(tmp_path, monkeypatch):
     assert (tmp_path / "images" / "aliyun_probe").exists()
 
 
+def test_aliyun_dom_images_are_not_saved_by_default(tmp_path, monkeypatch):
+    """生产路径默认只保存尝试元数据/截图，不无条件落盘背景图和拼图片。"""
+
+    from captcha_solvers import ai_slider
+
+    bg = Image.new("RGBA", (300, 180), (120, 130, 140, 255))
+    puzzle = Image.new("RGBA", (50, 50), (200, 200, 200, 255))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CAPTCHA_DEBUG_ALIYUN_IMAGES", raising=False)
+
+    ai_slider._save_debug_aliyun_images("images/aliyun_probe/dom_test", bg, puzzle)
+
+    assert not (tmp_path / "images" / "aliyun_probe").exists()
+
+
 def test_release_backoff_moves_left_when_mouseup_would_settle_right(monkeypatch):
     from captcha_solvers import ai_slider
 
@@ -3212,6 +3618,48 @@ def test_solve_slider_captcha_waits_for_delayed_success_after_drag(tmp_path, mon
     assert solved_calls["count"] >= 4
 
 
+def test_wait_for_captcha_success_uses_short_initial_failure_window(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    now = {"value": 0.0}
+    sleeps = []
+    monkeypatch.delenv("CAPTCHA_INITIAL_FAILURE_WAIT_SECONDS", raising=False)
+    monkeypatch.setattr(ai_slider.time, "time", lambda: now["value"])
+    monkeypatch.setattr(ai_slider, "_captcha_solved", lambda _page: False)
+    monkeypatch.setattr(ai_slider, "_captcha_explicitly_failed", lambda _page: False)
+
+    def fake_sleep(seconds, _stop_event=None):
+        sleeps.append(float(seconds))
+        now["value"] += float(seconds)
+
+    monkeypatch.setattr(ai_slider, "_sleep", fake_sleep)
+
+    assert ai_slider._wait_for_captcha_success(object(), timeout=2.8) is None
+    assert now["value"] <= 2.3
+    assert sleeps
+
+
+def test_wait_for_captcha_success_extends_when_success_appears(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    now = {"value": 0.0}
+    monkeypatch.delenv("CAPTCHA_INITIAL_FAILURE_WAIT_SECONDS", raising=False)
+    monkeypatch.setattr(ai_slider.time, "time", lambda: now["value"])
+    monkeypatch.setattr(ai_slider, "_captcha_explicitly_failed", lambda _page: False)
+
+    def fake_solved(_page):
+        return now["value"] >= 1.1
+
+    def fake_sleep(seconds, _stop_event=None):
+        now["value"] += float(seconds)
+
+    monkeypatch.setattr(ai_slider, "_captcha_solved", fake_solved)
+    monkeypatch.setattr(ai_slider, "_sleep", fake_sleep)
+
+    assert ai_slider._wait_for_captcha_success(object(), timeout=2.8) == "页面"
+    assert now["value"] > 1.5
+
+
 def test_solve_slider_captcha_rejects_verify_success_when_captcha_still_visible(tmp_path, monkeypatch):
     from captcha_solvers import ai_slider
 
@@ -3294,7 +3742,7 @@ def test_default_captcha_success_wait_covers_delayed_camoufox_success(monkeypatc
 
     monkeypatch.delenv("CAPTCHA_SUCCESS_WAIT_SECONDS", raising=False)
 
-    assert 4.8 <= ai_slider._captcha_success_wait_seconds() <= 5.2
+    assert 2.6 <= ai_slider._captcha_success_wait_seconds() <= 3.0
 
 
 def test_wait_for_captcha_success_uses_default_long_enough_for_slow_page_update(monkeypatch):
@@ -3309,7 +3757,7 @@ def test_wait_for_captcha_success_uses_default_long_enough_for_slow_page_update(
         now["value"] += float(seconds)
 
     monkeypatch.setattr(ai_slider, "_sleep", fake_sleep)
-    monkeypatch.setattr(ai_slider, "_captcha_solved", lambda _page: now["value"] >= 4.0)
+    monkeypatch.setattr(ai_slider, "_captcha_solved", lambda _page: now["value"] >= 2.0)
 
     assert ai_slider._wait_for_captcha_success(object(), timeout=ai_slider._captcha_success_wait_seconds()) == "页面"
 
@@ -3537,7 +3985,7 @@ def test_register_qwen_minimizes_slider_window_before_releasing_lock(monkeypatch
     monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **_kwargs: FakeSliderLock())
     monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
     monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda _page, label="": events.append("focus") or True)
-    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", lambda *args, **kwargs: events.append("wait_submit") or True)
     monkeypatch.setattr(qwenv4, "minimize_page_window", lambda _page, label="": events.append("minimize") or True, raising=False)
     monkeypatch.setattr(qwenv4, "solve_slider_captcha", lambda *args, **kwargs: CaptchaSolverResult(ok=True, message="ok"))
 
@@ -3550,7 +3998,59 @@ def test_register_qwen_minimizes_slider_window_before_releasing_lock(monkeypatch
         label="[账号 1/2]",
     ) is True
 
-    assert events == ["lock_enter", "topmost_enter", "focus", "topmost_exit", "minimize", "lock_exit"]
+    assert events == ["lock_enter", "topmost_enter", "focus", "topmost_exit", "minimize", "lock_exit", "wait_submit"]
+
+
+def test_register_qwen_releases_slider_lock_before_waiting_for_post_captcha_submission(monkeypatch):
+    """验证码通过后的业务提交等待不需要前台焦点，应在释放滑块锁后后台执行。"""
+
+    events = []
+
+    class FakeSliderLock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("lock_exit")
+            return False
+
+    class FakeTopmost:
+        def __enter__(self):
+            events.append("topmost_enter")
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("topmost_exit")
+            return False
+
+    class Page:
+        def goto(self, *args, **kwargs):
+            pass
+
+        def evaluate(self, *args, **kwargs):
+            return "pending activation"
+
+    monkeypatch.setattr(qwenv4.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **_kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda _page, label="": events.append("focus") or True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", lambda *args, **kwargs: CaptchaSolverResult(ok=True, message="ok"))
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda _page, **_kwargs: events.append("minimize") or True, raising=False)
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", lambda *args, **kwargs: events.append("wait_submit") or True)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(enabled=True, fallback_manual=False),
+        label="[账号 1/2]",
+    ) is True
+
+    assert events.index("wait_submit") > events.index("lock_exit")
 
 
 def test_register_qwen_minimizes_slider_window_on_solver_failure(monkeypatch):
@@ -3649,7 +4149,7 @@ def test_submit_registration_form_uses_background_dom_events(monkeypatch):
     ) is True
 
     combined_script = "\n".join(script for script, _payload in scripts)
-    assert waits == [('input[name="username"]', 20000)]
+    assert waits == [('input[name="username"]', 2500)]
     assert "HTMLInputElement.prototype" in combined_script
     assert "input[name=\"username\"]" in combined_script
     assert "input[name=\"email\"]" in combined_script
@@ -3661,6 +4161,40 @@ def test_submit_registration_form_uses_background_dom_events(monkeypatch):
         "email": "test@example.com",
         "password": "Password1!",
     }
+
+
+
+
+def test_register_qwen_reopens_register_page_when_initial_form_submit_times_out(monkeypatch):
+    """Camoufox 偶发注册页未加载出表单；初始提交超时应重进注册页再提交一次，避免直接丢账号。"""
+    import qwenv4
+
+    calls = {"goto": 0, "submit": 0}
+
+    class Page:
+        def inner_text(self, selector):
+            return "待激活"
+
+    def fake_goto(_page):
+        calls["goto"] += 1
+        return True
+
+    def fake_submit(*_args, **_kwargs):
+        calls["submit"] += 1
+        if calls["submit"] == 1:
+            raise TimeoutError('Page.wait_for_selector: Timeout 2500ms exceeded')
+        return True
+
+    monkeypatch.setattr(qwenv4.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", lambda seconds: True)
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", fake_goto)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", fake_submit)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "submitted")
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: False)
+
+    assert qwenv4.register_qwen(Page(), "Test User", "test@example.com", "Password1!") is True
+    assert calls["goto"] == 2
+    assert calls["submit"] == 2
 
 
 def test_register_qwen_uses_background_submit_without_front_clicks(monkeypatch):
@@ -3979,6 +4513,363 @@ def test_register_qwen_polls_captcha_without_unconditional_five_second_sleep(mon
 
 
 
+def test_register_qwen_uses_short_post_captcha_wait_for_ddddocr(monkeypatch):
+    import qwenv4
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, CaptchaSolverResult
+
+    seen = {}
+
+    class Page:
+        def evaluate(self, _script):
+            return "pending activation verification email"
+
+    class FakeSliderLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTopmost:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "captcha")
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", lambda *args, **kwargs: CaptchaSolverResult(ok=True, message="ok"))
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda *args, **kwargs: True, raising=False)
+
+    def fake_wait(_page, timeout=3.0, interval=0.25):
+        seen["timeout"] = timeout
+        return True
+
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", fake_wait)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, fallback_manual=False),
+    ) is True
+    assert seen["timeout"] <= 2.0
+
+
+def test_register_qwen_resubmits_after_slider_success_when_form_returns_request_aborted(monkeypatch):
+    import qwenv4
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, CaptchaSolverResult
+
+    calls = {"submit": 0, "body": 0, "post_wait": 0, "solver": 0}
+
+    class Page:
+        def evaluate(self, _script, *args):
+            calls["body"] += 1
+            if calls["submit"] < 2:
+                return "Sign up to Qwen\nCreate Account\nRequest aborted"
+            return "pending activation verification email"
+
+    class FakeSliderLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTopmost:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_submit(*args, **kwargs):
+        calls["submit"] += 1
+        return True
+
+    def fake_post_wait(*args, **kwargs):
+        calls["post_wait"] += 1
+        return False
+
+    def fake_solver(*args, **kwargs):
+        calls["solver"] += 1
+        return CaptchaSolverResult(ok=True, message="ok")
+
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", fake_submit)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "captcha" if calls["submit"] == 1 else "submitted")
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", fake_post_wait)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: calls["submit"] == 1)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", fake_solver)
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda *args, **kwargs: True, raising=False)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, fallback_manual=False),
+    ) is True
+    assert calls["solver"] == 1
+    assert calls["submit"] == 2
+
+
+
+
+
+
+def test_submit_registration_form_uses_short_initial_field_wait(monkeypatch):
+    import qwenv4
+
+    seen = {"timeout": None, "evaluate": False}
+
+    class Page:
+        def wait_for_selector(self, selector, timeout=0):
+            assert selector == 'input[name="username"]'
+            seen["timeout"] = timeout
+
+        def evaluate(self, script, payload):
+            seen["evaluate"] = True
+            assert payload["email"] == "test@example.com"
+            return True
+
+    assert qwenv4.submit_registration_form_background(
+        Page(),
+        name="Test User",
+        email="test@example.com",
+        password="Password1!",
+    ) is True
+    assert seen["evaluate"] is True
+    assert seen["timeout"] <= 3000
+
+
+def test_register_qwen_skips_slow_resubmit_when_form_field_disappeared(monkeypatch):
+    import qwenv4
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, CaptchaSolverResult
+
+    calls = {"submit": 0, "body": 0, "post_wait": 0, "solver": 0, "form_visible": 0}
+
+    class Page:
+        def evaluate(self, _script, *args):
+            calls["body"] += 1
+            # 首次滑块后读到旧表单文案/Request aborted，但实际表单字段已经消失。
+            if calls["body"] <= 1:
+                return "Sign up to Qwen\nCreate Account\nRequest aborted"
+            return "pending activation verification email"
+
+        def locator(self, selector):
+            assert selector == 'input[name="username"]'
+            return self
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self, timeout=0):
+            calls["form_visible"] += 1
+            assert timeout <= 500
+            return False
+
+    class FakeSliderLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTopmost:
+        hwnd = 123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __bool__(self):
+            return True
+
+    def fake_submit(*args, **kwargs):
+        calls["submit"] += 1
+        return True
+
+    def fake_post_wait(*args, **kwargs):
+        calls["post_wait"] += 1
+        return False
+
+    def fake_solver(*args, **kwargs):
+        calls["solver"] += 1
+        return CaptchaSolverResult(ok=True, message="ok")
+
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", fake_submit)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "captcha" if calls["submit"] == 1 else "submitted")
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", fake_post_wait)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: calls["submit"] == 1)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", fake_solver)
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda *args, **kwargs: True, raising=False)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, fallback_manual=False),
+    ) is True
+    assert calls["solver"] == 1
+    assert calls["form_visible"] == 1
+    assert calls["submit"] == 1
+
+
+
+
+
+
+def test_register_qwen_returns_after_fast_post_captcha_submission(monkeypatch):
+    """滑块通过后若短轮询已确认提交成功，不应继续读旧 body 或触发慢速重提交。"""
+    import qwenv4
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, CaptchaSolverResult
+
+    calls = {"submit": 0, "post_wait": 0, "body": 0}
+
+    class Page:
+        def evaluate(self, *_args, **_kwargs):
+            calls["body"] += 1
+            return "Sign up to Qwen Create Account"
+
+    class FakeSliderLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTopmost:
+        hwnd = 123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __bool__(self):
+            return True
+
+    def fake_submit(*_args, **_kwargs):
+        calls["submit"] += 1
+        return True
+
+    def fake_wait_for_registration_submission(*_args, **_kwargs):
+        calls["post_wait"] += 1
+        return True
+
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", fake_submit)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "captcha")
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", fake_wait_for_registration_submission)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: calls["submit"] == 1)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", lambda *_args, **_kwargs: CaptchaSolverResult(ok=True, message="ok"))
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda *_args, **_kwargs: True, raising=False)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, fallback_manual=False),
+    ) is True
+    assert calls["post_wait"] == 1
+    assert calls["submit"] == 1
+    assert calls["body"] == 0
+
+
+def test_register_qwen_treats_post_captcha_resubmit_missing_form_as_submitted(monkeypatch):
+    """真实 Camoufox 日志：滑块已过后旧 body 仍含注册文案，但表单已消失；重提交超时不应让账号失败。"""
+    import qwenv4
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, CaptchaSolverResult
+
+    calls = {"submit": 0, "body": 0, "post_wait": 0}
+
+    class Page:
+        pass
+
+    class FakeSliderLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTopmost:
+        ok = True
+        hwnd = 123
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_submit(*_args, **_kwargs):
+        calls["submit"] += 1
+        if calls["submit"] >= 2:
+            raise TimeoutError('Page.wait_for_selector: Timeout 2500ms exceeded')
+        return True
+
+    def fake_read_body(*_args, **_kwargs):
+        calls["body"] += 1
+        if calls["body"] == 1:
+            return "create account"
+        return "pending activation"
+
+    def fake_wait_for_registration_submission(*_args, **_kwargs):
+        calls["post_wait"] += 1
+        return False
+
+    monkeypatch.setattr(qwenv4.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(qwenv4, "sleep_interruptible", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_completion", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "goto_register_page_with_retry", lambda _page: True)
+    monkeypatch.setattr(qwenv4, "submit_registration_form_background", fake_submit)
+    monkeypatch.setattr(qwenv4, "wait_for_captcha_or_submission_after_submit", lambda *_args, **_kwargs: "captcha")
+    monkeypatch.setattr(qwenv4, "wait_for_registration_submission", fake_wait_for_registration_submission)
+    monkeypatch.setattr(qwenv4, "detect_captcha", lambda _page: calls["submit"] == 1)
+    monkeypatch.setattr(qwenv4, "acquire_slider_lock", lambda **kwargs: FakeSliderLock())
+    monkeypatch.setattr(qwenv4, "hold_page_topmost", lambda _page, label="": FakeTopmost(), raising=False)
+    monkeypatch.setattr(qwenv4, "focus_page_for_slider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(qwenv4, "solve_slider_captcha", lambda *_args, **_kwargs: CaptchaSolverResult(ok=True, message="ok"))
+    monkeypatch.setattr(qwenv4, "minimize_page_window", lambda *_args, **_kwargs: True, raising=False)
+    monkeypatch.setattr(qwenv4, "read_page_body_text", fake_read_body)
+    monkeypatch.setattr(qwenv4, "registration_form_input_visible", lambda *_args, **_kwargs: True)
+
+    assert qwenv4.register_qwen(
+        Page(),
+        "Test User",
+        "test@example.com",
+        "Password1!",
+        captcha_solver_config=CaptchaSolverConfig(mode="ddddocr", attempts=3, fallback_manual=False),
+    ) is True
+    assert calls["submit"] == 2
+    assert calls["post_wait"] >= 1
+
+
 def test_register_qwen_retries_background_submit_when_form_still_visible(monkeypatch):
     import qwenv4
 
@@ -4004,4 +4895,200 @@ def test_register_qwen_retries_background_submit_when_form_still_visible(monkeyp
     assert qwenv4.register_qwen(Page(), "Test User", "test@example.com", "Password1!") is True
     assert calls["submit"] == 2
     assert 5.0 not in sleeps
+
+
+
+
+
+
+def test_release_hold_range_default_is_short_for_fast_slider(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.delenv("CAPTCHA_RELEASE_HOLD_MIN_SECONDS", raising=False)
+    monkeypatch.delenv("CAPTCHA_RELEASE_HOLD_MAX_SECONDS", raising=False)
+
+    low, high = ai_slider._release_hold_seconds_range()
+
+    assert 0.23 <= low <= 0.32
+    assert 0.38 <= high <= 0.48
+
+
+
+def test_success_poll_timing_defaults_are_fast_but_stable(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.delenv("CAPTCHA_SUCCESS_STABLE_SECONDS", raising=False)
+    monkeypatch.delenv("CAPTCHA_SUCCESS_POLL_SECONDS", raising=False)
+
+    assert 0.55 <= ai_slider._captcha_success_stable_seconds() <= 0.7
+    assert 0.20 <= ai_slider._captcha_success_poll_seconds() <= 0.30
+
+
+def test_success_poll_timing_can_be_overridden(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.setenv("CAPTCHA_SUCCESS_STABLE_SECONDS", "1.1")
+    monkeypatch.setenv("CAPTCHA_SUCCESS_POLL_SECONDS", "0.4")
+
+    assert ai_slider._captcha_success_stable_seconds() == 1.1
+    assert ai_slider._captcha_success_poll_seconds() == 0.4
+
+
+def test_release_hold_range_can_be_overridden(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.setenv("CAPTCHA_RELEASE_HOLD_MIN_SECONDS", "0.6")
+    monkeypatch.setenv("CAPTCHA_RELEASE_HOLD_MAX_SECONDS", "0.9")
+
+    assert ai_slider._release_hold_seconds_range() == (0.6, 0.9)
+
+
+
+def test_solve_slider_captcha_treats_detached_screenshot_after_disappear_as_success(monkeypatch, tmp_path):
+    from captcha_solvers import ai_slider
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, solve_slider_captcha
+
+    class Root:
+        pass
+
+    states = {"find_calls": 0}
+
+    def fake_find_root(_page):
+        states["find_calls"] += 1
+        if states["find_calls"] == 1:
+            return Root()
+        return None
+
+    monkeypatch.setattr(ai_slider, "_find_captcha_root", fake_find_root)
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ai_slider, "_screenshot_locator", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("Locator.screenshot: Element is not attached to the DOM")))
+    monkeypatch.setattr(ai_slider, "_page_body_has_pending_captcha_text", lambda _page: False)
+    monkeypatch.setattr(ai_slider.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ai_slider, "_sleep", lambda *_args, **_kwargs: None)
+
+    result = solve_slider_captcha(
+        object(),
+        CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, fallback_manual=False),
+        image_dir=str(tmp_path),
+    )
+
+    assert result.ok is True
+    assert "验证码已消失" in result.message
+
+
+def test_solve_slider_captcha_rechecks_disappeared_captcha_after_success_wait_timeout(monkeypatch, tmp_path):
+    from captcha_solvers import ai_slider
+    from captcha_solvers.ai_slider import CaptchaSolverConfig, solve_slider_captcha
+
+    class Root:
+        pass
+
+    solved_checks = {"count": 0}
+    metadata = []
+
+    monkeypatch.setattr(ai_slider, "_find_captcha_root", lambda _page: Root())
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ai_slider, "_screenshot_locator", lambda _root, path: Path(path).write_bytes(b"fake"))
+    monkeypatch.setattr(ai_slider, "_build_drag_plan", lambda *_args: {
+        "start_x": 10.0,
+        "start_y": 20.0,
+        "distance": 150.0,
+        "max_distance": 300.0,
+        "source": "ddddocr",
+        "alternatives": [150.0],
+    })
+    monkeypatch.setattr(ai_slider, "_perform_drag_with_focus_retry", lambda *_args, **_kwargs: 150.0)
+    monkeypatch.setattr(ai_slider, "_wait_for_captcha_success", lambda *args, **kwargs: None)
+
+    def fake_solved(_page):
+        solved_checks["count"] += 1
+        return True
+
+    monkeypatch.setattr(ai_slider, "_captcha_solved", fake_solved)
+    monkeypatch.setattr(ai_slider, "_write_captcha_attempt_metadata", lambda **kwargs: metadata.append(kwargs))
+
+    result = solve_slider_captcha(
+        object(),
+        CaptchaSolverConfig(enabled=True, mode="ddddocr", attempts=3, api_key="", fallback_manual=False),
+        image_dir=str(tmp_path),
+    )
+
+    assert result.ok is True
+    assert "验证码已消失" in result.message
+    assert metadata[-1]["outcome"] == "success"
+    assert solved_checks["count"] >= 1
+
+
+def test_wait_for_captcha_success_returns_quickly_on_explicit_failure(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    class DummyRoot:
+        def inner_text(self, timeout=1000):
+            return "验证失败，请重试"
+
+    class DummyPage:
+        pass
+
+    sleep_calls = []
+    monkeypatch.setattr(ai_slider, "_find_captcha_root", lambda _page: DummyRoot())
+    monkeypatch.setattr(ai_slider, "_page_body_has_pending_captcha_text", lambda _page: False)
+    monkeypatch.setattr(ai_slider, "_sleep", lambda seconds, stop_event: sleep_calls.append(seconds))
+
+    result = ai_slider._wait_for_captcha_success(DummyPage(), timeout=3.5)
+
+    assert result is None
+    assert sleep_calls == []
+
+
+def test_default_captcha_success_wait_is_shorter_for_fast_retry(monkeypatch):
+    from captcha_solvers import ai_slider
+
+    monkeypatch.delenv("CAPTCHA_SUCCESS_WAIT_SECONDS", raising=False)
+
+    assert 2.6 <= ai_slider._captcha_success_wait_seconds() <= 3.0
+
+
+def test_write_captcha_attempt_metadata_creates_json_sidecar(tmp_path):
+    from captcha_solvers import ai_slider
+
+    screenshot = tmp_path / "captcha_ai_sample.png"
+    screenshot.write_bytes(b"fakepng")
+    plan = {
+        "source": "ddddocr",
+        "distance": 190,
+        "selected_target_x": 195.0,
+        "raw_selected_target_x": 200.0,
+        "target_right_bias": -5.0,
+        "selected_target_index": 1,
+        "ddddocr_target_x": 200.0,
+        "white_gap_target_x": 198.0,
+        "match_target_x": 202.0,
+        "hold_state": {"puzzleLeft": 193.0, "sliderLeft": 193.0},
+    }
+
+    path = ai_slider._write_captcha_attempt_metadata(
+        screenshot_path=str(screenshot),
+        label="[账号 1/1]",
+        attempt=2,
+        mode="ddddocr",
+        plan=plan,
+        outcome="failure",
+        message="滑块仍未通过",
+        success_source=None,
+    )
+
+    assert path == str(screenshot.with_suffix(".json"))
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert data["label"] == "[账号 1/1]"
+    assert data["attempt"] == 2
+    assert data["mode"] == "ddddocr"
+    assert data["outcome"] == "failure"
+    assert data["message"] == "滑块仍未通过"
+    assert data["plan"]["selected_target_x"] == 195.0
+    assert data["alignment"]["delta"] == 2.0
+
+
+
+
+
 

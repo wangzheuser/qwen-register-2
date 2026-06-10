@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import itertools
+import os
+import re
 import threading
 import time
 from collections import deque
@@ -24,10 +26,22 @@ DEFAULT_SLIDER_FILE_LOCK_TIMEOUT = 240.0
 def _foreground_intent_lock_path(lock_path: str | Path) -> Path:
     """跨进程前台意图锁路径。
 
-    该锁用于在真正持有前台文件锁前声明“将要使用前台”。slider/window
-    都需要持有它，从而避免一个进程已经准备拖滑块时，另一个进程新建窗口抢前台。
+    该锁只用于 slider 阶段，在真正持有前台文件锁前声明“将要使用前台”。
+    window 启动/新建页不再等待该文件锁；Camoufox new_page 偶发卡顿时若
+    window 也等待/持有跨进程锁，会拖慢整个滑块流水线。父进程启动槽仍可
+    用该文件探测并节流新 worker，真正拖动则由 slider 文件锁兜底。
     """
     return Path(f"{lock_path}.intent")
+
+
+def _slider_file_queue_path(lock_path: str | Path) -> Path:
+    """跨进程 slider FIFO 队列目录。"""
+    return Path(f"{lock_path}.queue")
+
+
+def _sanitize_queue_label(label: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(label or "slider"))
+    return text[:48] or "slider"
 
 
 class SliderLockTimeout(RuntimeError):
@@ -218,6 +232,60 @@ def _acquire_foreground_file_lock(
 
 
 @contextmanager
+def _acquire_slider_file_queue_turn(
+    *,
+    label: str,
+    lock_path: str | Path,
+    stop_event: Optional[object],
+    poll_interval: float,
+    file_lock_timeout: float,
+) -> Iterator[None]:
+    """用目录票据实现跨进程 slider FIFO，避免后来的进程插队文件锁。
+
+    portalocker 的非阻塞轮询不保证公平性；并发 Camoufox worker 中会出现
+    早等待者长期卡在 intent/file lock，而后来的账号先拿到滑块锁。
+    这里用原子创建票据文件 + 文件名排序作为轻量 FIFO。
+    """
+    queue_dir = _slider_file_queue_path(lock_path)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    now_ns = time.time_ns()
+    ticket = queue_dir / f"{now_ns:020d}-{os.getpid()}-{threading.get_ident()}-{_sanitize_queue_label(label)}.ticket"
+    try:
+        ticket.write_text(str(time.monotonic()), encoding="utf-8")
+        wait_started = time.monotonic()
+        last_wait_log = wait_started
+        while True:
+            if _cancelled(stop_event):
+                raise SliderLockTimeout("等待跨进程滑块队列时收到停止请求")
+            try:
+                tickets = sorted(queue_dir.glob("*.ticket"), key=lambda path: path.name)
+            except Exception:
+                tickets = [ticket]
+            if tickets and tickets[0].name == ticket.name:
+                yield
+                return
+            elapsed = time.monotonic() - wait_started
+            if elapsed >= file_lock_timeout:
+                raise SliderLockTimeout(
+                    f"等待跨进程滑块队列超时 ({elapsed:.1f}s/{file_lock_timeout:.1f}s)"
+                )
+            now = time.monotonic()
+            if now - last_wait_log >= 5.0:
+                print(
+                    f"  ⏳ {label + ' ' if label else ''}等待跨进程滑块队列 "
+                    f"elapsed={elapsed:.1f}s queue={len(tickets)}...",
+                    flush=True,
+                )
+                last_wait_log = now
+            time.sleep(poll_interval)
+    finally:
+        try:
+            ticket.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@contextmanager
 def acquire_slider_lock(
     label: str = "",
     *,
@@ -241,26 +309,33 @@ def acquire_slider_lock(
             poll_interval=poll_interval,
             announce_acquired=False,
         )
-        intent_lock = _acquire_foreground_file_lock(
-            kind="slider-intent",
-            label=label,
-            lock_path=_foreground_intent_lock_path(lock_path),
-            stop_event=stop_event,
-            poll_interval=poll_interval,
-            file_lock_timeout=file_lock_timeout,
-            flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
-        )
-        file_lock = _acquire_foreground_file_lock(
-            kind="slider",
+        with _acquire_slider_file_queue_turn(
             label=label,
             lock_path=lock_path,
             stop_event=stop_event,
             poll_interval=poll_interval,
             file_lock_timeout=file_lock_timeout,
-            flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
-        )
-        _COORDINATOR.announce_acquired(request)
-        yield
+        ):
+            intent_lock = _acquire_foreground_file_lock(
+                kind="slider-intent",
+                label=label,
+                lock_path=_foreground_intent_lock_path(lock_path),
+                stop_event=stop_event,
+                poll_interval=poll_interval,
+                file_lock_timeout=file_lock_timeout,
+                flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
+            )
+            file_lock = _acquire_foreground_file_lock(
+                kind="slider",
+                label=label,
+                lock_path=lock_path,
+                stop_event=stop_event,
+                poll_interval=poll_interval,
+                file_lock_timeout=file_lock_timeout,
+                flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
+            )
+            _COORDINATOR.announce_acquired(request)
+            yield
     finally:
         if request is not None:
             _COORDINATOR.release(request)
@@ -285,11 +360,12 @@ def acquire_foreground_window_lock(
     poll_interval: float = 0.2,
     file_lock_timeout: float = DEFAULT_SLIDER_FILE_LOCK_TIMEOUT,
 ) -> Iterator[None]:
-    """串行化短前台窗口操作；滑块声明前台意图时 window 需避让。
+    """串行化本进程短前台窗口操作。
 
-    重要：Camoufox 启动/new_page 偶发卡顿，window 不能长期持有任何跨进程
-    文件锁，否则会把后续 slider 拖死。这里仅在进入前探测 slider intent 是否空闲，
-    探测成功后立即释放文件锁；实际滑块拖动前仍会强制置顶并复检焦点。
+    重要：Camoufox 启动/new_page 偶发卡顿，window 不能等待或持有任何跨进程
+    文件锁，否则会把后续 slider/worker 流水线拖慢。这里仅做进程内协调；
+    父进程在启动 worker 前可单独通过 intent 文件节流，真正滑块拖动前仍会
+    通过 slider 文件锁、Windows 置顶和焦点复检兜底。
     """
     request = None
     try:
@@ -300,20 +376,6 @@ def acquire_foreground_window_lock(
             poll_interval=poll_interval,
             announce_acquired=False,
         )
-        intent_probe = _acquire_foreground_file_lock(
-            kind="window-intent",
-            label=label,
-            lock_path=_foreground_intent_lock_path(lock_path),
-            stop_event=stop_event,
-            poll_interval=poll_interval,
-            file_lock_timeout=file_lock_timeout,
-            flags=(portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING) if portalocker is not None else None,
-        )
-        if intent_probe is not None:
-            try:
-                intent_probe.release()
-            except Exception:
-                pass
         _COORDINATOR.announce_acquired(request)
         yield
     finally:

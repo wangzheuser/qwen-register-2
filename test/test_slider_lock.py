@@ -275,21 +275,19 @@ def test_window_lock_does_not_wait_for_cross_process_foreground_file_lock(tmp_pa
             assert True
 
 
-def test_window_lock_waits_while_cross_process_slider_intent_exists(tmp_path):
-    """跨进程滑块正在占用前台时，window 操作不能进入抢焦点。"""
+def test_window_lock_does_not_wait_while_cross_process_slider_intent_exists(tmp_path):
+    """window 不等待跨进程 slider intent，避免 Camoufox 启动等待时间计入账号耗时。"""
     lock_path = tmp_path / "cross-process-intent.lock"
     intent_path = tmp_path / "cross-process-intent.lock.intent"
 
     with portalocker.Lock(str(intent_path), timeout=0):
-        with pytest.raises(SliderLockTimeout):
-            with acquire_foreground_window_lock(
-                "[窗口]",
-                lock_path=lock_path,
-                poll_interval=0.005,
-                file_lock_timeout=0.03,
-            ):
-                pytest.fail("slider intent 存在时 window 不应进入前台临界区")
-
+        with acquire_foreground_window_lock(
+            "[窗口]",
+            lock_path=lock_path,
+            poll_interval=0.005,
+            file_lock_timeout=0.03,
+        ):
+            assert True
 
 
 def test_window_locks_can_overlap_without_slider_intent(tmp_path):
@@ -317,26 +315,62 @@ def test_window_locks_can_overlap_without_slider_intent(tmp_path):
 
     assert entered == ["first", "second"]
 
-def test_window_intent_timeout_does_not_poison_local_window_lock(tmp_path):
-    """跨进程 slider intent 等待超时后，必须释放本进程 window owner。"""
+def test_window_lock_ignores_cross_process_slider_intent_without_poisoning_local_lock(tmp_path):
+    """window 忽略跨进程 intent 后，本进程 window owner 仍应正常释放。"""
     lock_path = tmp_path / "window-intent-timeout.lock"
     intent_path = tmp_path / "window-intent-timeout.lock.intent"
 
     with portalocker.Lock(str(intent_path), timeout=0):
-        with pytest.raises(SliderLockTimeout):
-            with acquire_foreground_window_lock(
-                "[窗口等待]",
-                lock_path=lock_path,
-                poll_interval=0.005,
-                file_lock_timeout=0.03,
-            ):
-                pytest.fail("slider intent 存在时 window 不应进入")
+        with acquire_foreground_window_lock(
+            "[窗口等待]",
+            lock_path=lock_path,
+            poll_interval=0.005,
+            file_lock_timeout=0.03,
+        ):
+            assert True
 
     with acquire_foreground_window_lock("[窗口恢复]", lock_path=lock_path, poll_interval=0.005):
         assert True
 
 
-def test_window_lock_waits_on_cross_process_slider_intent(tmp_path, monkeypatch):
+
+def test_slider_file_queue_is_fifo_across_independent_waiters(tmp_path):
+    from captcha_solvers import slider_lock
+
+    lock_path = tmp_path / "cross-process-fifo.lock"
+    entered = []
+
+    def waiter(name):
+        with slider_lock._acquire_slider_file_queue_turn(
+            label=name,
+            lock_path=lock_path,
+            stop_event=None,
+            poll_interval=0.005,
+            file_lock_timeout=2.0,
+        ):
+            entered.append(name)
+
+    with slider_lock._acquire_slider_file_queue_turn(
+        label="[持有者]",
+        lock_path=lock_path,
+        stop_event=None,
+        poll_interval=0.005,
+        file_lock_timeout=2.0,
+    ):
+        first = threading.Thread(target=waiter, args=("[跨进程滑块1]",))
+        second = threading.Thread(target=waiter, args=("[跨进程滑块2]",))
+        first.start()
+        time.sleep(0.03)
+        second.start()
+        time.sleep(0.03)
+        assert entered == []
+
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert entered == ["[跨进程滑块1]", "[跨进程滑块2]"]
+
+def test_window_lock_does_not_probe_cross_process_slider_intent(tmp_path, monkeypatch):
     from captcha_solvers import slider_lock
 
     if slider_lock.portalocker is None:
@@ -347,14 +381,13 @@ def test_window_lock_waits_on_cross_process_slider_intent(tmp_path, monkeypatch)
     blocker = slider_lock.portalocker.Lock(str(intent_path), timeout=0, flags=slider_lock.portalocker.LockFlags.EXCLUSIVE | slider_lock.portalocker.LockFlags.NON_BLOCKING)
     blocker.acquire()
     try:
-        with pytest.raises(SliderLockTimeout):
-            with slider_lock.acquire_foreground_window_lock(
-                label="window-test",
-                lock_path=lock_path,
-                poll_interval=0.005,
-                file_lock_timeout=0.03,
-            ):
-                pytest.fail("slider intent 存在时 window 不应进入")
+        with slider_lock.acquire_foreground_window_lock(
+            label="window-test",
+            lock_path=lock_path,
+            poll_interval=0.005,
+            file_lock_timeout=0.03,
+        ):
+            assert True
     finally:
         blocker.release()
 

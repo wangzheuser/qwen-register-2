@@ -51,6 +51,7 @@ from integrations.qwen2api import (
     DEFAULT_QWEN2API_ADMIN_KEY,
     DEFAULT_QWEN2API_BASE_URL,
     DEFAULT_QWEN2API_TIMEOUT,
+    Qwen2ApiAsyncSyncer,
     Qwen2ApiSyncConfig,
     sync_account_to_qwen2api,
 )
@@ -68,6 +69,7 @@ IMAGES_DIR = "images"
 HEADLESS = False  # 必须为 False 以支持手动完成验证码
 RUN_LOG_MAX_BYTES = 128 * 1024 * 1024
 POST_CAPTCHA_SUBMISSION_TIMEOUT = 8.0
+DDDDOCR_POST_CAPTCHA_SUBMISSION_TIMEOUT = 1.5
 
 BROWSER_ARGS = [
     '--disable-blink-features=AutomationControlled',
@@ -107,6 +109,7 @@ _ACCOUNT_SAVE_LOCKS_GUARD = threading.Lock()
 STOP_EVENT = threading.Event()
 INTERRUPT_COUNT = 0
 WORKER_START_INTERVAL_SECONDS = 0.1
+QWEN2API_ASYNC_SYNCER = Qwen2ApiAsyncSyncer()
 
 
 @dataclass
@@ -132,6 +135,53 @@ class AccountRunSummary:
             return self.success_count == other
         return super().__eq__(other)
 
+
+
+class AccountStageTimer:
+    """记录单账号阶段耗时，用于并发性能排查。"""
+
+    def __init__(self, label, *, clock=None, clock_values=None):
+        self.label = label
+        if clock_values is not None:
+            iterator = iter(clock_values)
+            self._clock = lambda: next(iterator)
+        else:
+            self._clock = clock or time.perf_counter
+        self._last = float(self._clock())
+        self._stages = []
+
+    def mark(self, name):
+        now = float(self._clock())
+        self._stages.append((str(name), max(0.0, now - self._last)))
+        self._last = now
+
+    def print_summary(self, *, success):
+        if not self._stages:
+            return
+        status = "成功" if success else "失败"
+        print(f"  ⏱️ {self.label} 耗时拆分（{status}）:")
+        for name, seconds in self._stages:
+            print(f"     - {name}: {seconds:.1f}s")
+
+
+def post_captcha_submission_timeout(captcha_solver_config=None):
+    """验证码通过后的短确认窗口；ddddocr 默认更短，避免串行滑块后继续空等。"""
+    mode = str(getattr(captcha_solver_config, "mode", "") or "").strip().lower()
+    if mode == "ddddocr":
+        raw = os.getenv("DDDDOCR_POST_CAPTCHA_SUBMISSION_TIMEOUT", "").strip()
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        return DDDDOCR_POST_CAPTCHA_SUBMISSION_TIMEOUT
+    raw = os.getenv("POST_CAPTCHA_SUBMISSION_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return POST_CAPTCHA_SUBMISSION_TIMEOUT
 
 def format_success_rate(success_count, total_accounts):
     if total_accounts <= 0:
@@ -688,6 +738,24 @@ def maybe_sync_account_to_qwen2api(email, password, token, config, label=""):
         print(f"  ⚠️ {prefix}qwen2API 同步失败: {result.message}")
     return result
 
+
+def maybe_sync_account_to_qwen2api_async(email, password, token, config, label=""):
+    """把 qwen2API 同步提交到后台队列；本地保存成功不再等待远端同步。"""
+    if not config.enabled:
+        return None
+    return QWEN2API_ASYNC_SYNCER.submit(
+        email=email,
+        password=password,
+        token=token,
+        config=config,
+        label=label,
+    ) is not None
+
+
+def flush_qwen2api_async_sync(timeout=30):
+    """等待已提交的 qwen2API 后台同步完成。"""
+    return QWEN2API_ASYNC_SYNCER.flush(timeout=timeout)
+
 # ──────────────────────────────────────────────────────────
 # 浏览器代理
 # ──────────────────────────────────────────────────────────
@@ -905,7 +973,7 @@ def detect_captcha(page):
                     return True
             except Exception:
                 continue
-        body_text = page.evaluate('document.body.innerText') or ''
+        body_text = read_page_body_text(page)
         return any(text in body_text for text in captcha_texts)
     except Exception:
         return False
@@ -955,7 +1023,7 @@ def wait_for_captcha_completion(page, email, password, name, timeout=600):
 
             # 检查页面是否有错误
             try:
-                body_text = page.evaluate('document.body.innerText') or ''
+                body_text = read_page_body_text(page)
                 if 'error' in body_text.lower() or 'failed' in body_text.lower():
                     print(f"  ❌ 检测到注册错误")
                     return False
@@ -1025,6 +1093,63 @@ def registration_submission_detected(body_text):
     )
 
 
+def registration_form_still_visible(body_text):
+    """判断注册提交/滑块后是否仍停留在注册表单。"""
+    text = body_text or ""
+    lower = text.lower()
+    return (
+        "create account" in lower
+        or "创建账号" in text
+        or "request aborted" in lower
+    )
+
+
+def registration_form_input_visible(page, timeout=500):
+    """快速判断注册表单输入框是否仍可见，避免滑块后误走 20s 慢等待重提交流程。"""
+    try:
+        return bool(page.locator('input[name="username"]').first.is_visible(timeout=timeout))
+    except AttributeError:
+        # 测试替身或极简 page 可能没有 locator；保守返回 True，沿用原重提交流程。
+        return True
+    except Exception:
+        return False
+
+
+_TRANSIENT_BODY_READ_MARKERS = (
+    "document.body is null",
+    "Execution context was destroyed",
+    "Cannot find context with specified id",
+    "Target page, context or browser has been closed",
+    "Page.evaluate: Target closed",
+)
+
+
+def _is_transient_body_read_error(error):
+    message = str(error)
+    return any(marker in message for marker in _TRANSIENT_BODY_READ_MARKERS)
+
+
+def read_page_body_text(page, timeout=0.0, interval=0.15):
+    """安全读取页面正文；兼容 Camoufox/Firefox 导航瞬间 document.body 为空。"""
+    deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
+    script = "() => document.body ? document.body.innerText : ''"
+    while True:
+        if STOP_EVENT.is_set():
+            return ""
+        try:
+            return page.evaluate(script) or ""
+        except Exception as exc:
+            if not _is_transient_body_read_error(exc):
+                return ""
+            if time.monotonic() >= deadline:
+                return ""
+            wait_seconds = min(float(interval), max(0.0, deadline - time.monotonic()))
+            if wait_seconds <= 0:
+                return ""
+            if not sleep_interruptible(wait_seconds):
+                return ""
+
+
 def wait_for_registration_submission(page, timeout=3.0, interval=0.25):
     """验证码通过后短轮询注册提交状态，避免无条件固定等待。"""
     deadline = time.monotonic() + max(0.0, float(timeout))
@@ -1032,7 +1157,7 @@ def wait_for_registration_submission(page, timeout=3.0, interval=0.25):
         if STOP_EVENT.is_set():
             return False
         try:
-            body = page.evaluate("document.body.innerText") or ""
+            body = read_page_body_text(page, timeout=1.0, interval=0.2)
             if registration_submission_detected(body):
                 return True
         except Exception:
@@ -1192,7 +1317,11 @@ def wait_for_email(inbox_page, timeout=300, keywords=('qwen', 'alibaba')):
 
 def submit_registration_form_background(page, name, email, password):
     """用 DOM 合成事件后台填写并提交注册表单，避免并发窗口抢占前台焦点。"""
-    page.wait_for_selector('input[name="username"]', timeout=20000)
+    try:
+        form_wait_timeout = int(os.getenv("REGISTRATION_FORM_WAIT_TIMEOUT_MS", "2500"))
+    except Exception:
+        form_wait_timeout = 2500
+    page.wait_for_selector('input[name="username"]', timeout=max(500, min(form_wait_timeout, 20000)))
     script = """
     ({ name, email, password }) => {
       const setInputValue = (selector, value) => {
@@ -1270,6 +1399,25 @@ def goto_register_page_with_retry(page, attempts=3):
 
 
 
+def submit_registration_form_with_retry(page, name, email, password, *, max_attempts=2):
+    """提交注册表单；Camoufox 偶发页面未渲染表单时重进注册页再试一次。"""
+    attempts = max(1, int(max_attempts or 1))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return submit_registration_form_background(page, name=name, email=email, password=password)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            print(f"  ⚠️ 注册表单暂不可用，重新打开注册页后重试 ({attempt}/{attempts - 1}): {str(exc)[:100]}")
+            goto_register_page_with_retry(page)
+            sleep_interruptible(0.2)
+    if last_error is not None:
+        raise last_error
+    return False
+
+
 
 def wait_for_captcha_or_submission_after_submit(page, timeout=5.0, interval=0.25):
     """提交注册表单后短轮询验证码/提交状态，避免无条件固定等待。"""
@@ -1283,7 +1431,7 @@ def wait_for_captcha_or_submission_after_submit(page, timeout=5.0, interval=0.25
         except Exception:
             pass
         try:
-            body = page.evaluate('document.body.innerText') or ''
+            body = read_page_body_text(page)
             if registration_submission_detected(body):
                 return "submitted"
         except Exception:
@@ -1369,12 +1517,12 @@ def register_qwen(
 
     try:
         goto_register_page_with_retry(page)
-        submit_registration_form_background(page, name=name, email=email, password=password)
+        submit_registration_form_with_retry(page, name=name, email=email, password=password)
 
         submit_state = wait_for_captcha_or_submission_after_submit(page, timeout=5.0)
         if submit_state == "timeout":
             try:
-                body_after_submit = page.evaluate('document.body.innerText') or ''
+                body_after_submit = read_page_body_text(page)
             except Exception:
                 body_after_submit = ''
             if 'create account' in body_after_submit.lower() or '创建账号' in body_after_submit:
@@ -1385,22 +1533,26 @@ def register_qwen(
             return False
 
         # 检测是否出现验证码
+        post_captcha_submission_needed = False
         if submit_state == "captcha" or detect_captcha(page):
             print("  🤖 检测到验证码弹窗")
             label_prefix = f"{label} " if label else ""
             if os.getenv("CAPTCHA_FORCE_VERIFY_SUCCESS", "").strip():
                 install_aliyun_verify_success_route(page)
+            topmost_hwnd = None
             try:
                 with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
                     try:
                         with hold_page_topmost(page, label=label) as topmost_ok:
                             if not topmost_ok:
                                 return False
+                            topmost_hwnd = getattr(topmost_ok, "hwnd", None)
                             if not focus_page_for_slider(page, label=label):
                                 return False
 
                             if not detect_captcha(page):
                                 print(f"  ✅ {label_prefix}验证码已在等待期间完成")
+                                post_captcha_submission_needed = True
                             else:
                                 manual_trace_records = None
                                 if captcha_solver_config is not None and captcha_solver_config.enabled:
@@ -1413,7 +1565,7 @@ def register_qwen(
                                     )
                                     if solver_result.ok:
                                         print(f"  ✅ {label_prefix}{solver_result.message}")
-                                        wait_for_registration_submission(page, timeout=POST_CAPTCHA_SUBMISSION_TIMEOUT)
+                                        post_captcha_submission_needed = True
                                     elif captcha_solver_config.fallback_manual:
                                         print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
                                         manual_trace_records = attach_manual_trace_recorder(
@@ -1443,7 +1595,7 @@ def register_qwen(
                                             label=label,
                                             image_dir=IMAGES_DIR,
                                         )
-                                        wait_for_registration_submission(page, timeout=POST_CAPTCHA_SUBMISSION_TIMEOUT)
+                                        post_captcha_submission_needed = True
                                     else:
                                         print(f"  ❌ {label_prefix}{solver_result.message}")
                                         return False
@@ -1476,16 +1628,24 @@ def register_qwen(
                                         label=label,
                                         image_dir=IMAGES_DIR,
                                     )
-                                    wait_for_registration_submission(page, timeout=POST_CAPTCHA_SUBMISSION_TIMEOUT)
+                                    post_captcha_submission_needed = True
                     finally:
                         print(f"  🪟 {label_prefix}滑块阶段结束，正在最小化窗口", flush=True)
-                        minimize_page_window(page, label=label)
+                        if topmost_hwnd is not None:
+                            minimize_page_window(page, label=label, hwnd=topmost_hwnd)
+                        else:
+                            minimize_page_window(page, label=label)
             except SliderLockTimeout as e:
                 print(f"  🛑 {label_prefix}{e}")
                 return False
 
+        if post_captcha_submission_needed:
+            if wait_for_registration_submission(page, timeout=post_captcha_submission_timeout(captcha_solver_config)):
+                print("  ✅ 注册已提交，等待邮箱验证")
+                return True
+
         # 检查注册结果
-        body = page.evaluate('document.body.innerText') or ''
+        body = read_page_body_text(page, timeout=1.5, interval=0.2)
 
         # 成功标志
         if registration_submission_detected(body):
@@ -1497,8 +1657,50 @@ def register_qwen(
             print(f"  ❌ 注册出错: {body[:200]}")
             return False
 
+        if post_captcha_submission_needed and registration_form_still_visible(body):
+            print("  ⚠️ 滑块后仍停留在注册表单，正在同页重试提交")
+            if not registration_form_input_visible(page, timeout=500):
+                print("  ℹ️ 注册表单字段已不可见，跳过慢速重提交流程，继续确认提交状态")
+                if wait_for_registration_submission(page, timeout=post_captcha_submission_timeout(captcha_solver_config)):
+                    print("  ✅ 注册已提交，等待邮箱验证")
+                    return True
+                body = read_page_body_text(page, timeout=1.5, interval=0.2)
+                if registration_submission_detected(body):
+                    print("  ✅ 注册已提交，等待邮箱验证")
+                    return True
+                if not registration_form_still_visible(body):
+                    print("  ✅ 注册可能已提交")
+                    return True
+                print(f"  ⚠️ 页面状态异常: {body[:200]}")
+                return False
+            try:
+                submit_registration_form_background(page, name=name, email=email, password=password)
+            except Exception as resubmit_exc:
+                print(f"  ⚠️ 滑块后重提交流程不可用，改为确认提交状态: {str(resubmit_exc)[:100]}")
+                if wait_for_registration_submission(page, timeout=post_captcha_submission_timeout(captcha_solver_config)):
+                    print("  ✅ 注册已提交，等待邮箱验证")
+                    return True
+                body = read_page_body_text(page, timeout=1.5, interval=0.2)
+                if registration_submission_detected(body):
+                    print("  ✅ 注册已提交，等待邮箱验证")
+                    return True
+                if not registration_form_still_visible(body):
+                    print("  ✅ 注册可能已提交")
+                    return True
+                print(f"  ⚠️ 页面状态异常: {body[:200]}")
+                return False
+            resubmit_state = wait_for_captcha_or_submission_after_submit(page, timeout=5.0)
+            if resubmit_state == "submitted":
+                print("  ✅ 注册已提交，等待邮箱验证")
+                return True
+            wait_for_registration_submission(page, timeout=post_captcha_submission_timeout(captcha_solver_config))
+            body = read_page_body_text(page, timeout=1.5, interval=0.2)
+            if registration_submission_detected(body):
+                print("  ✅ 注册已提交，等待邮箱验证")
+                return True
+
         # 假设成功（表单已消失）
-        if 'create account' not in body.lower() and '创建账号' not in body:
+        if not registration_form_still_visible(body):
             print("  ✅ 注册可能已提交")
             return True
 
@@ -1510,7 +1712,7 @@ def register_qwen(
     except PlaywrightTimeout as e:
         print(f"  ⚠️ 操作超时: {str(e)[:100]}")
         try:
-            body = page.evaluate('document.body.innerText') or ''
+            body = read_page_body_text(page)
             body_lower = body.lower()
             if '待激活' in body or '激活账号' in body or 'pending activation' in body_lower or 'verification email' in body_lower:
                 print("  ✅ 虽然发生超时，但已检测到注册提交状态")
@@ -1555,10 +1757,17 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
     """执行单个账号注册任务；每个线程独立创建 Playwright 实例。"""
     started_at = time.perf_counter()
 
+    label = f"[账号 {account_index}/{total_accounts}]"
+    stage_timer = AccountStageTimer(label)
+    summary_printed = False
+
     def result(success):
+        nonlocal summary_printed
+        if not summary_printed:
+            stage_timer.print_summary(success=bool(success))
+            summary_printed = True
         return AccountRunResult(success=success, duration_seconds=time.perf_counter() - started_at)
 
-    label = f"[账号 {account_index}/{total_accounts}]"
     print(f"\n{'═'*60}")
     print(f"🔢 {label}")
     print(f"{'═'*60}")
@@ -1568,6 +1777,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
     except ValueError as e:
         print(f"  ❌ {label} {e}")
         return result(False)
+    stage_timer.mark("代理解析")
     proxy_dict = proxy_info["proxy"]
     if proxy_dict:
         print(f"  🌐 {label} 浏览器代理: {proxy_info['display']}")
@@ -1593,6 +1803,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                         args=build_browser_launch_args(account_index),
                         proxy=proxy_dict,
                     )
+                stage_timer.mark("浏览器启动")
             except Exception as e:
                 print(f"  ❌ {label} 浏览器启动失败: {e}")
                 return result(False)
@@ -1616,6 +1827,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     api_proxy=args.api_proxy,
                     context=context,
                 )
+                stage_timer.mark("邮箱 Provider")
 
                 used_emails_store = UsedEmailsStore("used_emails.json")
                 max_email_retries = 1 if isinstance(provider, GeneratorEmailProvider) else 3
@@ -1631,6 +1843,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
 
                 if not email:
                     raise EmailCreationError("多次创建邮箱均重复，跳过当前账号")
+                stage_timer.mark("邮箱创建")
 
                 first_name = gen_first_name()
                 password = gen_password()
@@ -1642,6 +1855,7 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
 
                 with acquire_foreground_window_lock(label=f"{label} 新建注册页", stop_event=STOP_EVENT):
                     qwen = context.new_page()
+                stage_timer.mark("新建页面")
                 install_aliyun_callback_probe(qwen)
                 if getattr(args, "captcha_force_verify_success", False):
                     install_aliyun_verify_success_route(qwen)
@@ -1657,19 +1871,20 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     captcha_solver_config=build_captcha_solver_config(args),
                     label=label,
                 )
+                stage_timer.mark("滑块/注册")
                 if not registered:
                     print(f"  ❌ {label} 注册失败，跳过...")
                     return result(False)
 
                 verify_url = provider.get_activation_link(timeout=300)
+                stage_timer.mark("邮箱激活")
 
                 print(f"  🔄 {label} 正在打开验证链接...")
                 qwen.goto(verify_url, wait_until='domcontentloaded', timeout=30000)
 
                 print(f"  🔑 {label} 正在提取认证令牌...")
                 tokens = wait_for_token_extraction(qwen, timeout=5.0)
-
-                qwen.screenshot(path=f'{IMAGES_DIR}/qwen_verified_{account_index}.png')
+                stage_timer.mark("验证与令牌")
 
                 if tokens['token']:
                     print(f"  ✅ {label} 已提取认证令牌: {tokens['token'][:80]}...")
@@ -1690,16 +1905,22 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     device_id=tokens.get('device_id'),
                     user_role=tokens.get('user_role', 'user'),
                 )
-                maybe_sync_account_to_qwen2api(
+                maybe_sync_account_to_qwen2api_async(
                     email=email,
                     password=password,
                     token=tokens.get('token'),
                     config=build_qwen2api_sync_config(args),
                     label=label,
                 )
+                stage_timer.mark("保存/同步提交")
 
-                print(f"  ✅ {label} 已验证并保存！")
-                return result(True)
+                print(f"  ✅ {label} 已验证并保存！", flush=True)
+                success_result = result(True)
+                try:
+                    qwen.screenshot(path=f'{IMAGES_DIR}/qwen_verified_{account_index}.png')
+                except Exception as e:
+                    print(f"  ⚠️ {label} 截图失败，已忽略，不影响账号保存: {e}")
+                return success_result
 
             except EmailProviderError as e:
                 print(f"  ❌ {label} 邮箱服务错误: {e}")
@@ -1827,6 +2048,9 @@ def main():
         print("💾 结果保存到:")
         print(f"   - {OUTPUT_FILE_TXT}（文本格式）")
         print(f"   - {OUTPUT_FILE_JSON}（JSON 数组格式）")
+        if args.sync_qwen2api:
+            print("🔁 正在等待 qwen2API 后台同步完成...")
+            flush_qwen2api_async_sync(timeout=max(1, int(args.qwen2api_timeout)))
         print(f"{'═'*60}")
     finally:
         close_run_logging(logging_state)

@@ -138,3 +138,46 @@ def test_sync_account_returns_failure_for_timeout_exception():
     assert result.ok is False
     assert result.skipped is False
     assert "超时" in result.message
+
+
+
+def test_async_syncer_submit_returns_immediately_and_flushes(monkeypatch):
+    from integrations.qwen2api import Qwen2ApiAsyncSyncer, Qwen2ApiSyncResult
+
+    calls = []
+
+    def fake_sync(**kwargs):
+        calls.append(kwargs["email"])
+        return Qwen2ApiSyncResult(ok=True, message=f"qwen2API 同步成功: {kwargs['email']}")
+
+    monkeypatch.setattr("integrations.qwen2api.sync_account_to_qwen2api", fake_sync)
+    syncer = Qwen2ApiAsyncSyncer(max_workers=1)
+
+    future = syncer.submit(
+        email="user@example.com",
+        password="Password1!",
+        token="token-123",
+        config=Qwen2ApiSyncConfig(enabled=True),
+        label="[账号 1/1]",
+    )
+
+    assert future is not None
+    assert syncer.flush(timeout=2) == 1
+    assert calls == ["user@example.com"]
+
+
+def test_async_syncer_skips_disabled_config_without_future():
+    from integrations.qwen2api import Qwen2ApiAsyncSyncer
+
+    syncer = Qwen2ApiAsyncSyncer(max_workers=1)
+
+    future = syncer.submit(
+        email="user@example.com",
+        password="Password1!",
+        token="token-123",
+        config=Qwen2ApiSyncConfig(enabled=False),
+        label="[账号 1/1]",
+    )
+
+    assert future is None
+    assert syncer.flush(timeout=1) == 0

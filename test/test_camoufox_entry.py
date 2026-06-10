@@ -138,6 +138,91 @@ def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_pa
     assert "user_agent" not in seen["page_kwargs"]
     assert seen["page_kwargs"]["viewport"] == {"width": 1280, "height": 800}
 
+
+def test_camoufox_worker_prints_stage_timing_summary(monkeypatch, tmp_path, capsys):
+    import types
+    import qwenv4_camoufox
+
+    class DummyPage:
+        def __init__(self, context):
+            self.context = context
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def screenshot(self, *args, **kwargs):
+            pass
+
+        def evaluate(self, *args, **kwargs):
+            return "验证完成"
+
+        def close(self):
+            pass
+
+    class DummyContext:
+        def close(self):
+            pass
+
+    class DummyBrowser:
+        def new_page(self, **kwargs):
+            return DummyPage(DummyContext())
+
+        def close(self):
+            pass
+
+    class DummyCamoufox:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return DummyBrowser()
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyProvider:
+        def create_inbox(self):
+            return "user@example.com"
+
+        def get_activation_link(self, timeout=300):
+            return "https://studio.qwen.ai/auth/verify?token=test"
+
+        def cleanup(self):
+            pass
+
+    args = types.SimpleNamespace(
+        email_provider="mailtm",
+        verbose=False,
+        api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
+        captcha_timeout=600,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1:7860",
+        qwen2api_admin_key="admin",
+        qwen2api_timeout=30,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwenv4_camoufox, "Camoufox", DummyCamoufox)
+    monkeypatch.setattr(qwenv4_camoufox.EmailProviderFactory, "create", lambda **_kwargs: DummyProvider())
+    monkeypatch.setattr(qwenv4_camoufox.UsedEmailsStore, "claim", lambda self, email: True)
+    monkeypatch.setattr(qwenv4_camoufox, "register_qwen", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_token_extraction", lambda _page, timeout=5.0: {
+        "token": "token-1",
+        "active_token": None,
+        "device_id": None,
+        "user_role": "user",
+    })
+    monkeypatch.setattr(qwenv4_camoufox, "save_account", lambda **_kwargs: None)
+
+    assert qwenv4_camoufox.run_single_account(1, 1, args, None).success is True
+    out = capsys.readouterr().out
+    assert "[账号 1/1] 耗时拆分" in out
+    assert "邮箱创建" in out
+    assert "滑块/注册" in out
+    assert "邮箱激活" in out
+    assert "验证与令牌" in out
+
 def test_camoufox_worker_returns_false_when_browser_launch_fails(monkeypatch, capsys):
     import qwenv4_camoufox
 
@@ -699,6 +784,93 @@ def test_camoufox_worker_defers_force_verify_route_to_register_flow(monkeypatch,
     assert installed == {"callback_probe": True, "verify_route": False}
 
 
+
+def test_camoufox_worker_saves_account_before_noncritical_screenshot(monkeypatch, tmp_path):
+    import qwenv4_camoufox
+
+    events = []
+
+    class DummyPage:
+        def __init__(self, context):
+            self.context = context
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def screenshot(self, *args, **kwargs):
+            events.append("screenshot")
+            raise RuntimeError("slow screenshot should be noncritical")
+
+        def evaluate(self, *args, **kwargs):
+            return "验证完成"
+
+        def close(self):
+            pass
+
+    class DummyContext:
+        def close(self):
+            pass
+
+    class DummyBrowser:
+        def new_page(self, **kwargs):
+            return DummyPage(DummyContext())
+
+    class DummyCamoufox:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return DummyBrowser()
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+    class DummyProvider:
+        def create_inbox(self):
+            return "user@example.com"
+
+        def get_activation_link(self, timeout=300):
+            return "https://studio.qwen.ai/auth/verify?token=test"
+
+        def cleanup(self):
+            pass
+
+    args = types.SimpleNamespace(
+        email_provider="mailtm",
+        verbose=False,
+        api_proxy=None,
+        browser_proxy="http://127.0.0.1:7890",
+        captcha_timeout=600,
+        sync_qwen2api=False,
+        qwen2api_base_url="http://127.0.0.1:7860",
+        qwen2api_admin_key="admin",
+        qwen2api_timeout=30,
+    )
+
+    def fake_save_account(**_kwargs):
+        events.append("save")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(qwenv4_camoufox, "Camoufox", DummyCamoufox)
+    monkeypatch.setattr(qwenv4_camoufox.EmailProviderFactory, "create", lambda **_kwargs: DummyProvider())
+    monkeypatch.setattr(qwenv4_camoufox.UsedEmailsStore, "claim", lambda self, email: True)
+    monkeypatch.setattr(qwenv4_camoufox, "register_qwen", lambda *args, **kwargs: True)
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_token_extraction", lambda _page, timeout=5.0: {
+        "token": "token-1",
+        "active_token": None,
+        "device_id": None,
+        "user_role": "user",
+    })
+    monkeypatch.setattr(qwenv4_camoufox, "save_account", fake_save_account)
+    monkeypatch.setattr(qwenv4_camoufox, "maybe_sync_account_to_qwen2api_async", lambda **_kwargs: events.append("sync"))
+
+    result = qwenv4_camoufox.run_single_account(1, 1, args, None)
+
+    assert result.success is True
+    assert events[:2] == ["save", "sync"]
+    assert "screenshot" in events[2:]
+
+
 def test_camoufox_worker_treats_screenshot_failure_as_warning(monkeypatch, tmp_path, capsys):
     import qwenv4_camoufox
 
@@ -946,6 +1118,45 @@ def test_camoufox_subprocess_timeout_after_saved_log_returns_success(monkeypatch
     assert "已保存成功但子进程未及时退出" in output
 
 
+
+def test_camoufox_subprocess_new_page_stage_has_short_idle_timeout(monkeypatch, capsys):
+    import qwenv4_camoufox
+
+    class DummyStdout:
+        def __iter__(self):
+            return iter([
+                "  🔐 [账号 1/10] 新建注册页 已获得 Camoufox 运行时锁 waited=0.000s\n",
+            ])
+
+    class DummyProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdout = DummyStdout()
+            self.returncode = None
+            self.pid = 12345
+
+        def poll(self):
+            return None
+
+    terminated = {"called": False}
+    times = iter([0.0, 0.0, 6.1, 6.1, 6.1])
+
+    monkeypatch.setenv("CAMOUFOX_STAGE_NEW_PAGE_IDLE_TIMEOUT", "5")
+    monkeypatch.setattr(qwenv4_camoufox.subprocess, "Popen", DummyProcess)
+    monkeypatch.setattr(qwenv4_camoufox, "_terminate_process_tree", lambda *_args, **_kwargs: terminated.__setitem__("called", True))
+    monkeypatch.setattr(qwenv4_camoufox.time, "monotonic", lambda: next(times, 6.1))
+    monkeypatch.setattr(qwenv4_camoufox.time, "perf_counter", lambda: 0.0)
+    monkeypatch.setattr(qwenv4_camoufox, "sleep_interruptible", lambda _seconds: True)
+    monkeypatch.setattr(qwenv4_camoufox, "wait_for_camoufox_start_slot", lambda *args, **kwargs: True)
+
+    args = qwenv4_camoufox.parse_args(["10", "--concurrency", "3", "--account-retries", "1"])
+    result = qwenv4_camoufox.run_account_subprocess(1, 10, args, timeout_seconds=5)
+
+    output = capsys.readouterr().out
+    assert result.success is False
+    assert terminated["called"] is True
+    assert "新建注册页阶段无输出超时" in output
+
+
 def test_camoufox_subprocess_timeout_is_based_on_output_idle_time(monkeypatch):
     import qwenv4_camoufox
 
@@ -986,30 +1197,42 @@ def test_camoufox_subprocess_timeout_is_based_on_output_idle_time(monkeypatch):
     assert terminated["called"] is False
 
 
-def test_camoufox_start_slot_returns_false_quickly_while_slider_intent_exists(monkeypatch, tmp_path):
+def test_camoufox_start_slot_waits_for_slider_intent_to_clear(monkeypatch, tmp_path):
     import qwenv4_camoufox
 
     monkeypatch.chdir(tmp_path)
     intent_path = tmp_path / ".slider-captcha.lock.intent"
-    called = {"foreground": False}
+    called = {"foreground": False, "sleep": 0}
 
+    @contextmanager
     def fake_foreground_lock(*_args, **_kwargs):
         called["foreground"] = True
-        raise AssertionError("intent 已占用时不应进入 foreground window 锁")
+        yield
+
+    held_lock = None
+
+    def fake_sleep(_seconds):
+        called["sleep"] += 1
+        nonlocal held_lock
+        if held_lock is not None:
+            held_lock.release()
+            held_lock = None
+        return True
 
     monkeypatch.setattr(qwenv4_camoufox, "acquire_foreground_window_lock", fake_foreground_lock)
+    monkeypatch.setattr(qwenv4_camoufox, "sleep_interruptible", fake_sleep)
 
-    with portalocker.Lock(str(intent_path), timeout=0):
-        started = time.perf_counter()
-        result = qwenv4_camoufox.wait_for_camoufox_start_slot(
-            "[账号 1/10]",
-            stop_event=threading.Event(),
-            file_lock_timeout=0.03,
-        )
+    held_lock = portalocker.Lock(str(intent_path), timeout=0)
+    held_lock.acquire()
+    result = qwenv4_camoufox.wait_for_camoufox_start_slot(
+        "[账号 1/10]",
+        stop_event=threading.Event(),
+        file_lock_timeout=1.0,
+    )
 
-    assert result is False
-    assert called["foreground"] is False
-    assert time.perf_counter() - started < 1.0
+    assert result is True
+    assert called["foreground"] is True
+    assert called["sleep"] >= 1
 
 def test_camoufox_worker_retries_transient_verification_navigation_error(monkeypatch, tmp_path):
     import qwenv4_camoufox

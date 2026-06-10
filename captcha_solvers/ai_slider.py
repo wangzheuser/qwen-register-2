@@ -184,6 +184,7 @@ def solve_slider_captcha(
     last_screenshot: Optional[str] = None
     last_corrected_target_x: Optional[float] = None
     last_target_signature: Optional[tuple[Optional[float], Optional[float], Optional[float], str]] = None
+    active_target_alternatives: Optional[list[float]] = None
     repeated_target_index = 0
     network_debug = _attach_captcha_network_debug(page, prefix) if os.getenv("CAPTCHA_DEBUG_NETWORK") else None
     max_config_attempts = max(1, int(config.attempts))
@@ -257,7 +258,17 @@ def solve_slider_captcha(
                 continue
 
             screenshot_path = str(Path(image_dir) / f"captcha_ai_{int(time.time() * 1000)}_{attempt}.png")
-            _screenshot_locator(root, screenshot_path)
+            try:
+                _screenshot_locator(root, screenshot_path)
+            except Exception as screenshot_exc:
+                if _captcha_solved(page):
+                    return CaptchaSolverResult(
+                        ok=True,
+                        message="验证码已消失，截图阶段视为通过",
+                        attempts=attempt,
+                        screenshot_path=None,
+                    )
+                raise screenshot_exc
             last_screenshot = screenshot_path
             print(f"  🖼️ {prefix}验证码截图: {screenshot_path}")
 
@@ -289,6 +300,16 @@ def solve_slider_captcha(
                 last_message = "ddddocr 本地识别未能得到可用滑块缺口"
                 consumed_attempts += 1
                 print(f"  ⚠️ {prefix}{last_message}，尝试刷新后重试")
+                _write_captcha_attempt_metadata(
+                    screenshot_path=last_screenshot or "",
+                    label=label,
+                    attempt=attempt,
+                    mode=mode,
+                    plan=drag_plan if isinstance(drag_plan, dict) else {},
+                    outcome="local_detection_failed",
+                    message=last_message,
+                    success_source=None,
+                )
                 _try_refresh_captcha(root)
                 _sleep(0.5, stop_event)
                 continue
@@ -329,12 +350,29 @@ def solve_slider_captcha(
                 drag_plan = _build_drag_plan(page, root, ai_distance)
                 drag_plan["label"] = label
             current_signature = _drag_plan_target_signature(drag_plan)
-            same_target_signature = current_signature == last_target_signature
-            if same_target_signature:
+            if active_target_alternatives is not None and _drag_plan_signatures_similar(
+                current_signature,
+                last_target_signature,
+            ):
+                repeated_target_index += 1
+                drag_plan["target_x_alternatives"] = list(active_target_alternatives)
+            elif current_signature == last_target_signature:
                 repeated_target_index += 1
             else:
                 repeated_target_index = 0
                 last_corrected_target_x = None
+                raw_alternatives = drag_plan.get("target_x_alternatives")
+                active_target_alternatives = []
+                if isinstance(raw_alternatives, list):
+                    for value in raw_alternatives:
+                        try:
+                            number = float(value)
+                        except Exception:
+                            continue
+                        if math.isfinite(number):
+                            active_target_alternatives.append(number)
+                if not active_target_alternatives:
+                    active_target_alternatives = None
             last_target_signature = current_signature
             target_alternatives = drag_plan.get("target_x_alternatives")
             selected_target_index: Optional[int] = None
@@ -482,6 +520,16 @@ def solve_slider_captcha(
                 success_message = "AI 滑块处理成功"
                 if success_source != "页面":
                     success_message = f"{success_message}（{success_source}已确认）"
+                _write_captcha_attempt_metadata(
+                    screenshot_path=last_screenshot or "",
+                    label=label,
+                    attempt=attempt,
+                    mode=mode,
+                    plan=drag_plan if isinstance(drag_plan, dict) else {},
+                    outcome="success",
+                    message=success_message,
+                    success_source=success_source,
+                )
                 return CaptchaSolverResult(
                     ok=True,
                     message=success_message,
@@ -490,7 +538,60 @@ def solve_slider_captcha(
                     screenshot_path=last_screenshot,
                 )
 
+            if _captcha_solved(page):
+                success_message = "验证码已消失，视为通过"
+                _write_captcha_attempt_metadata(
+                    screenshot_path=last_screenshot or "",
+                    label=label,
+                    attempt=attempt,
+                    mode=mode,
+                    plan=drag_plan if isinstance(drag_plan, dict) else {},
+                    outcome="success",
+                    message=success_message,
+                    success_source="页面",
+                )
+                return CaptchaSolverResult(
+                    ok=True,
+                    message=success_message,
+                    attempts=attempt,
+                    distance=last_distance,
+                    screenshot_path=last_screenshot,
+                )
+
+            late_success_wait = _captcha_late_success_recheck_seconds()
+            if late_success_wait > 0:
+                _sleep(late_success_wait, stop_event)
+                if _captcha_solved(page):
+                    success_message = "验证码延迟消失，视为通过"
+                    _write_captcha_attempt_metadata(
+                        screenshot_path=last_screenshot or "",
+                        label=label,
+                        attempt=attempt,
+                        mode=mode,
+                        plan=drag_plan if isinstance(drag_plan, dict) else {},
+                        outcome="success",
+                        message=success_message,
+                        success_source="页面",
+                    )
+                    return CaptchaSolverResult(
+                        ok=True,
+                        message=success_message,
+                        attempts=attempt,
+                        distance=last_distance,
+                        screenshot_path=last_screenshot,
+                    )
+
             last_message = "滑块仍未通过"
+            _write_captcha_attempt_metadata(
+                screenshot_path=last_screenshot or "",
+                label=label,
+                attempt=attempt,
+                mode=mode,
+                plan=drag_plan if isinstance(drag_plan, dict) else {},
+                outcome="failure",
+                message=last_message,
+                success_source=None,
+            )
             if network_debug:
                 _dump_captcha_network_debug(network_debug, prefix)
                 _dump_captcha_dom_debug(page, prefix)
@@ -516,6 +617,9 @@ def solve_slider_captcha(
                     _try_refresh_captcha(root)
                 except Exception:
                     pass
+                last_target_signature = None
+                active_target_alternatives = None
+                repeated_target_index = 0
                 _sleep(_captcha_retry_reset_wait_seconds(), stop_event)
                 _wait_for_captcha_ready(page, stop_event=stop_event, timeout=5)
             else:
@@ -541,6 +645,9 @@ def solve_slider_captcha(
                 root = _find_captcha_root(page)
                 if root is not None:
                     _try_refresh_captcha(root)
+                    last_target_signature = None
+                    active_target_alternatives = None
+                    repeated_target_index = 0
                     _wait_for_captcha_ready(page, stop_event=stop_event, timeout=5)
             except Exception:
                 pass
@@ -555,6 +662,70 @@ def solve_slider_captcha(
     )
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items() if _is_json_metadata_value(val)}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value if _is_json_metadata_value(item)]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+    return str(value)
+
+
+def _is_json_metadata_value(value: Any) -> bool:
+    return isinstance(value, (dict, list, tuple, str, int, float, bool, type(None)))
+
+
+def _write_captcha_attempt_metadata(
+    *,
+    screenshot_path: str,
+    label: str,
+    attempt: int,
+    mode: str,
+    plan: dict[str, Any],
+    outcome: str,
+    message: str,
+    success_source: Optional[str] = None,
+) -> Optional[str]:
+    """为每次滑块尝试写入 JSON 元数据，方便后续分析成功/失败差异。"""
+    if not screenshot_path:
+        return None
+    path = Path(screenshot_path).with_suffix(".json")
+    hold_state = plan.get("hold_state") if isinstance(plan, dict) else None
+    alignment = None
+    target_value = plan.get("calibrate_target_x") if isinstance(plan, dict) else None
+    if target_value is None and isinstance(plan, dict):
+        target_value = plan.get("selected_target_x")
+    if isinstance(hold_state, dict) and target_value is not None and hold_state.get("puzzleLeft") is not None:
+        try:
+            target = float(target_value)
+            puzzle = float(hold_state.get("puzzleLeft"))
+            alignment = {"target": target, "puzzle": puzzle, "delta": target - puzzle}
+        except Exception:
+            alignment = None
+    data = {
+        "timestamp_ms": int(time.time() * 1000),
+        "label": label,
+        "attempt": int(attempt),
+        "mode": mode,
+        "screenshot_path": screenshot_path,
+        "outcome": outcome,
+        "message": message,
+        "success_source": success_source,
+        "alignment": alignment,
+        "plan": _json_safe(plan or {}),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path)
+    except Exception as exc:
+        print(f"  ⚠️ 滑块元数据写入失败: {exc}")
+        return None
+
+
 def _is_focus_miss_drag_exception(exc: Exception, plan: dict[str, Any]) -> bool:
     if bool(plan.get("focus_missed")):
         return True
@@ -565,6 +736,7 @@ def _is_focus_miss_drag_exception(exc: Exception, plan: dict[str, Any]) -> bool:
             "未命中滑块窗口",
             "前台焦点确认失败",
             "放弃按下滑块",
+            "OS 鼠标轨迹异常",
         )
     )
 
@@ -1414,6 +1586,9 @@ def _wait_for_captcha_ready(page: Any, *, stop_event: Optional[Any] = None, time
                     bodyText.includes('访问验证') ||
                     bodyText.includes('验证您是真人') ||
                     bodyText.includes('拖动滑块完成拼图') ||
+                    bodyText.includes('Access Verification') ||
+                    bodyText.includes('Please complete the operation') ||
+                    bodyText.includes('real person') ||
                     Boolean(document.querySelector('[id^="aliyunCaptcha"], [class*="aliyunCaptcha"]'))
                   );
                   if (!img && !puzzle && !slider) {
@@ -1576,6 +1751,25 @@ def _drag_plan_target_signature(plan: dict[str, Any]) -> tuple[Optional[float], 
         rounded(plan.get("match_target_x")),
         str(plan.get("source") or ""),
     )
+
+
+def _drag_plan_signatures_similar(
+    current: tuple[Optional[float], Optional[float], Optional[float], str],
+    previous: Optional[tuple[Optional[float], Optional[float], Optional[float], str]],
+    *,
+    tolerance: float = 3.0,
+) -> bool:
+    """判断同一验证码连续截图造成的轻微视觉抖动，避免重置候选轮换。"""
+    if previous is None or current[3] != previous[3]:
+        return False
+    for current_value, previous_value in zip(current[:3], previous[:3]):
+        if current_value is None or previous_value is None:
+            if current_value is not previous_value:
+                return False
+            continue
+        if abs(float(current_value) - float(previous_value)) > tolerance:
+            return False
+    return True
 
 
 def _distance_alternatives(distance: float, max_distance: float) -> list[float]:
@@ -1785,6 +1979,8 @@ def _image_to_png_bytes(image: Any) -> bytes:
 
 
 def _save_debug_aliyun_images(prefix: str, bg: Any, puzzle: Any) -> None:
+    if os.getenv("CAPTCHA_DEBUG_ALIYUN_IMAGES", "").strip().lower() not in {"1", "true", "yes", "y", "on"}:
+        return
     try:
         path = Path(prefix)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1942,18 +2138,39 @@ def _choose_aliyun_target_x(
         return None, "图像匹配校准"
 
     # ddddocr 有时会把左侧待拖动拼图本身识别成目标；这类值通常只略高于
-    # min_real_target_x，而模板匹配会指向右侧真实缺口。没有白色缺口候选时，
-    # 若模板位置明显在右侧，优先使用模板，避免把滑块停在左半区。
+    # min_real_target_x。没有白色缺口候选时，若模板位于其右侧且 ddddocr
+    # 贴近真实目标下限，优先模板以避免先浪费一次左侧自匹配尝试。
     if (
         match_x is not None
         and white_gap_x is None
         and ddddocr_x < float(image_width) * 0.35
         and float(match_x) >= min_real_target_x
-        and float(match_x) > ddddocr_x + 80.0
+        and (
+            float(match_x) > ddddocr_x + 80.0
+            or (ddddocr_x <= min_real_target_x + 12.0 and float(match_x) > ddddocr_x + 18.0)
+        )
     ):
         return float(match_x), "图像匹配校准"
 
     if white_gap_x is not None and float(white_gap_x) >= min_real_target_x:
+        if (
+            match_x is not None
+            and float(match_x) >= min_real_target_x
+            and abs(float(match_x) - ddddocr_x) <= 8.0
+            and float(white_gap_x) > ddddocr_x + 30.0
+        ):
+            # 最新 Camoufox 失败样本显示：ddddocr 与模板匹配同时落在左侧时，
+            # 二者可能一起锁定了待拖动拼图本身，而右侧 white_gap 才是真缺口。
+            # 但中右部 ddddocr 被模板支持时仍保持原有优先级，避免浅色背景误检。
+            white_right_delta = float(white_gap_x) - ddddocr_x
+            ddddocr_near_left_edge = ddddocr_x <= min_real_target_x + 15.0
+            ddddocr_left_mid_with_near_gap = (
+                ddddocr_x < float(image_width) * 0.52
+                and white_right_delta <= 46.0
+            )
+            if ddddocr_near_left_edge or ddddocr_left_mid_with_near_gap:
+                return float(white_gap_x), "图像匹配校准"
+            return ddddocr_x, "ddddocr"
         if (
             match_x is not None
             and float(match_x) >= min_real_target_x
@@ -2411,12 +2628,30 @@ def _perform_drag(page: Any, plan: dict[str, float], adjustment_callback: Option
             if debug_path:
                 plan["drag_event_debug"] = debug_path
             raise RuntimeError("OS 拖动未命中滑块窗口")
-    time.sleep(random.uniform(0.55, 0.95))
+    release_hold_min, release_hold_max = _release_hold_seconds_range()
+    time.sleep(random.uniform(release_hold_min, release_hold_max))
     mouse.up()
     debug_path = _dump_drag_event_debug(page, label=str(plan.get("label") or ""))
     if debug_path:
         plan["drag_event_debug"] = debug_path
     return distance
+
+
+def _release_hold_seconds_range() -> tuple[float, float]:
+    """松手前短暂停顿范围；默认偏快，必要时可用环境变量恢复保守值。"""
+    try:
+        low = float(os.getenv("CAPTCHA_RELEASE_HOLD_MIN_SECONDS", "0.28"))
+    except Exception:
+        low = 0.28
+    try:
+        high = float(os.getenv("CAPTCHA_RELEASE_HOLD_MAX_SECONDS", "0.42"))
+    except Exception:
+        high = 0.42
+    low = max(0.05, min(low, 1.5))
+    high = max(0.05, min(high, 1.5))
+    if high < low:
+        low, high = high, low
+    return low, high
 
 
 def _drag_debug_artifacts_enabled() -> bool:
@@ -2618,12 +2853,14 @@ def _motion_state_looks_focus_missed(state: dict[str, Any]) -> bool:
         puzzle_box_x = float(state.get("puzzleBoxX", 0.0))
     except Exception:
         return False
-    return (
-        abs(slider_left) <= 0.5
-        and abs(puzzle_left) <= 0.5
-        and abs(slider_box_x - puzzle_box_x) <= 0.5
-        and slider_box_x > 0
-    )
+    if abs(slider_left) > 0.5 or abs(puzzle_left) > 0.5 or slider_box_x <= 0:
+        return False
+    if abs(slider_box_x - puzzle_box_x) <= 0.5:
+        return True
+    # 真实并发日志中出现过 sliderLeft/puzzleLeft 均为 0、sliderBoxX 正常但
+    # puzzleBoxX=0 的状态；这表示验证码 DOM/前台窗口状态异常，继续等待服务端
+    # 判定只会浪费一次失败等待，应按焦点/状态未命中快速重试。
+    return abs(puzzle_box_x) <= 0.5
 
 
 def _load_manual_trace(path: str) -> Optional[dict[str, Any]]:
@@ -3498,11 +3735,59 @@ def _captcha_solved(page: Any) -> bool:
     return False
 
 
+def _captcha_explicitly_failed(page: Any) -> bool:
+    """检测滑块组件是否已经明确给出失败/重试状态。"""
+    root = _find_captcha_root(page)
+    if root is None:
+        return False
+    try:
+        text = root.inner_text(timeout=500).lower()
+    except Exception:
+        return False
+    failure_words = (
+        "验证失败",
+        "验证未通过",
+        "校验失败",
+        "请重试",
+        "重新验证",
+        "verification failed",
+        "verify failed",
+        "failed to verify",
+        "try again",
+    )
+    return any(word in text for word in failure_words)
+
+
 def _captcha_success_wait_seconds() -> float:
     try:
-        return max(1.0, float(os.getenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "5.0")))
+        return max(1.0, float(os.getenv("CAPTCHA_SUCCESS_WAIT_SECONDS", "2.8")))
     except Exception:
-        return 5.0
+        return 2.8
+
+
+def _captcha_success_stable_seconds() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_SUCCESS_STABLE_SECONDS", "0.6"))
+    except Exception:
+        value = 0.6
+    return max(0.2, min(value, 2.0))
+
+
+def _captcha_success_poll_seconds() -> float:
+    try:
+        value = float(os.getenv("CAPTCHA_SUCCESS_POLL_SECONDS", "0.25"))
+    except Exception:
+        value = 0.25
+    return max(0.1, min(value, 1.0))
+
+
+def _captcha_initial_failure_wait_seconds() -> float:
+    """没有任何成功迹象时的快速失败窗口；看到成功迹象后仍使用完整稳定等待。"""
+    try:
+        value = float(os.getenv("CAPTCHA_INITIAL_FAILURE_WAIT_SECONDS", "2.1"))
+    except Exception:
+        value = 2.1
+    return max(0.5, min(value, 3.0))
 
 
 def _captcha_retry_reset_wait_seconds() -> float:
@@ -3510,6 +3795,14 @@ def _captcha_retry_reset_wait_seconds() -> float:
         return max(0.0, float(os.getenv("CAPTCHA_RETRY_RESET_WAIT_SECONDS", "0.8")))
     except Exception:
         return 0.8
+
+
+def _captcha_late_success_recheck_seconds() -> float:
+    """失败分支前的极短慢成功复查窗口，避免验证码刚消失就进入下一次拖动。"""
+    try:
+        return max(0.0, min(float(os.getenv("CAPTCHA_LATE_SUCCESS_RECHECK_SECONDS", "0.35")), 1.5))
+    except Exception:
+        return 0.35
 
 
 def _network_has_aliyun_verify_success(records: Optional[list[dict[str, Any]]]) -> bool:
@@ -3539,15 +3832,20 @@ def _wait_for_captcha_success(
     Aliyun 成功响应有时会在 DOM 仍显示验证码几秒后才到达；如果只固定等待 3 秒
     再检查一次页面，会把实际已通过的滑块误判为失败。
     """
-    deadline = time.time() + max(0.0, timeout)
+    start = time.time()
+    full_deadline = start + max(0.0, timeout)
+    initial_failure_deadline = start + min(max(0.0, timeout), _captcha_initial_failure_wait_seconds())
     stable_hits = 0
     stable_since: Optional[float] = None
-    required_stable_seconds = 1.0
+    saw_success_signal = False
+    required_stable_seconds = _captcha_success_stable_seconds()
+    poll_seconds = _captcha_success_poll_seconds()
     while True:
         if _is_cancelled(stop_event):
             return None
         now = time.time()
         if _captcha_solved(page):
+            saw_success_signal = True
             stable_hits += 1
             if stable_since is None:
                 stable_since = now
@@ -3556,13 +3854,16 @@ def _wait_for_captcha_success(
         else:
             stable_hits = 0
             stable_since = None
+            if _captcha_explicitly_failed(page):
+                return None
         # 只看到 VerifyCaptchaV2 返回成功还不足以说明前端/业务层已经放行。
         # 最新 Camoufox 真实日志中出现过服务端响应被替换为成功，但页面仍停留在
         # Access Verification 的情况；此时若直接返回成功，会跳过剩余重试并导致
         # 注册阶段误判。因此真正成功必须由页面验证码消失或成功文案确认且保持稳定。
+        deadline = full_deadline if saw_success_signal else initial_failure_deadline
         if now >= deadline:
             return None
-        _sleep(0.5, stop_event)
+        _sleep(min(poll_seconds, max(0.0, deadline - now)), stop_event)
 
 
 def _try_refresh_captcha(root: Any) -> None:
@@ -3645,5 +3946,6 @@ def _sleep(seconds: float, stop_event: Optional[Any]) -> None:
         if _is_cancelled(stop_event):
             return
         time.sleep(min(0.2, max(0.0, end_time - time.time())))
+
 
 
