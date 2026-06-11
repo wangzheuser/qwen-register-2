@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import time
 
-RATE_LIMIT_MAX_RETRIES = 9
+RATE_LIMIT_MAX_RETRIES = 99
 RATE_LIMIT_MIN_DELAY_SECONDS = 0.01
 RATE_LIMIT_MAX_DELAY_SECONDS = 0.1
 

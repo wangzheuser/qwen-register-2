@@ -14,6 +14,9 @@ from email_providers.retry import RATE_LIMIT_MAX_RETRIES
 from email_providers.store import UsedEmailsStore
 from email_providers.utils import extract_activation_link
 
+def test_rate_limit_max_retries_is_ninety_nine():
+    assert RATE_LIMIT_MAX_RETRIES == 99
+
 
 def test_extract_activation_link_prefers_qwen_verify_link_from_html():
     html = '''
@@ -110,7 +113,7 @@ def test_mailtm_retries_rate_limit_and_extracts_link(monkeypatch):
     assert calls.count(("GET", "/messages")) == 2
 
 
-def test_mailtm_rate_limit_retries_nine_times_with_random_short_delay(monkeypatch):
+def test_mailtm_rate_limit_retries_ninety_nine_times_with_random_short_delay(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.042)
     monkeypatch.setattr("email_providers.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
@@ -143,7 +146,7 @@ def test_mailtm_rate_limit_retries_nine_times_with_random_short_delay(monkeypatc
     assert sleep_calls == [0.042] * RATE_LIMIT_MAX_RETRIES
 
 
-def test_mailporary_rate_limit_retries_nine_times_with_random_short_delay(monkeypatch):
+def test_mailporary_rate_limit_retries_ninety_nine_times_with_random_short_delay(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.073)
     monkeypatch.setattr("email_providers.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
@@ -175,7 +178,7 @@ def test_mailporary_rate_limit_retries_nine_times_with_random_short_delay(monkey
     assert sleep_calls == [0.073] * RATE_LIMIT_MAX_RETRIES
 
 
-def test_mailtm_rate_limit_stops_after_nine_retries(monkeypatch):
+def test_mailtm_rate_limit_stops_after_ninety_nine_retries(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.015)
     monkeypatch.setattr("email_providers.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
@@ -217,7 +220,7 @@ def test_mailtm_transient_network_error_retries_like_rate_limit(monkeypatch):
     assert sleep_calls == [0.021, 0.021]
 
 
-def test_mailporary_rate_limit_stops_after_nine_retries(monkeypatch):
+def test_mailporary_rate_limit_stops_after_ninety_nine_retries(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.099)
     monkeypatch.setattr("email_providers.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
@@ -240,7 +243,7 @@ def test_mailporary_rate_limit_stops_after_nine_retries(monkeypatch):
     assert sleep_calls == [0.099] * RATE_LIMIT_MAX_RETRIES
 
 
-def test_mailporary_token_page_rate_limit_retries_nine_times(monkeypatch):
+def test_mailporary_token_page_rate_limit_retries_ninety_nine_times(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr("email_providers.retry.random.uniform", lambda minimum, maximum: 0.064)
     monkeypatch.setattr("email_providers.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
