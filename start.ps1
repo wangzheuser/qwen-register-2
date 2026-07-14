@@ -138,6 +138,14 @@ function Normalize-Provider([string]$RawValue) {
         "mail.tm" { return "mailtm" }
         "3" { return "mailporary" }
         "mailporary" { return "mailporary" }
+        "4" { return "gonebox" }
+        "gonebox" { return "gonebox" }
+        "5" { return "tempmail_lol" }
+        "tempmail_lol" { return "tempmail_lol" }
+        "tempmail.lol" { return "tempmail_lol" }
+        "6" { return "freecustom" }
+        "freecustom" { return "freecustom" }
+        "freecustom.email" { return "freecustom" }
         default { return $null }
     }
 }
@@ -153,6 +161,9 @@ function Prompt-Provider([string]$DefaultValue) {
         Write-Host "  1) generator.email"
         Write-Host "  2) mailtm"
         Write-Host "  3) mailporary"
+        Write-Host "  4) gonebox"
+        Write-Host "  5) tempmail_lol"
+        Write-Host "  6) freecustom"
         $raw = Read-LineValue "请选择邮箱服务 [$normalizedDefault]: "
         if ([string]::IsNullOrWhiteSpace($raw)) {
             return $normalizedDefault
@@ -161,7 +172,7 @@ function Prompt-Provider([string]$DefaultValue) {
         if ($null -ne $provider) {
             return $provider
         }
-        Write-Host "请输入 1/2/3 或 generator.email/mailtm/mailporary。"
+        Write-Host "请输入 1-6 或 generator.email/mailtm/mailporary/gonebox/tempmail_lol/freecustom。"
     }
 }
 

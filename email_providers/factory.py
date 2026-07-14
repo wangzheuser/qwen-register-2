@@ -5,9 +5,12 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import EmailProvider
+from .freecustom import FreeCustomProvider
 from .generator_email import GeneratorEmailProvider
+from .gonebox import GoneBoxProvider
 from .mailporary import MailporaryProvider
 from .mailtm import MailtmProvider
+from .tempmail_lol import TempMailLolProvider
 
 
 class EmailProviderFactory:
@@ -15,6 +18,11 @@ class EmailProviderFactory:
         "mailtm": MailtmProvider,
         "mail.tm": MailtmProvider,
         "mailporary": MailporaryProvider,
+        "gonebox": GoneBoxProvider,
+        "tempmail_lol": TempMailLolProvider,
+        "tempmail.lol": TempMailLolProvider,
+        "freecustom": FreeCustomProvider,
+        "freecustom.email": FreeCustomProvider,
         "generator.email": GeneratorEmailProvider,
         "generator": GeneratorEmailProvider,
     }

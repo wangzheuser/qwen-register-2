@@ -262,7 +262,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--email-provider",
         default="mailtm",
-        choices=["mailtm", "mail.tm", "mailporary", "generator.email", "generator"],
+        choices=["mailtm", "mail.tm", "mailporary", "gonebox", "tempmail_lol", "tempmail.lol", "freecustom", "freecustom.email", "generator.email", "generator"],
         help="邮箱服务类型，默认: mailtm",
     )
     parser.add_argument(
