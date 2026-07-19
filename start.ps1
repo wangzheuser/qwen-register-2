@@ -1,4 +1,5 @@
 param(
+    [string]$Mode = "",
     [switch]$DryRun,
     [switch]$SkipDependencyInstall,
     [switch]$InterruptCleanupSelfTest,
@@ -21,9 +22,7 @@ function Resolve-ProjectPath([string]$PathValue, [string]$DefaultName) {
     return (Join-Path $ProjectRoot $PathValue)
 }
 
-$ResolvedConfigPath = Resolve-ProjectPath $ConfigPath ".start-config.json"
 $RequirementsPath = Join-Path $ProjectRoot "requirements.txt"
-$ScriptPath = Join-Path $ProjectRoot "qwenv4.py"
 $VenvPath = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $PythonInterruptGraceSeconds = 15
@@ -39,6 +38,28 @@ function Read-LineValue([string]$PromptText) {
         return ""
     }
     return $line.Trim()
+}
+
+function Select-BrowserMode([string]$RequestedMode) {
+    $normalized = ([string]$RequestedMode).Trim().ToLowerInvariant()
+    switch ($normalized) {
+        { $_ -in @("playwright", "chromium", "1") } { return "playwright" }
+        { $_ -in @("camoufox", "2") } { return "camoufox" }
+        "" {
+            Write-Host "浏览器模式:"
+            Write-Host "  1) Playwright Chromium"
+            Write-Host "  2) Camoufox"
+            $selected = (Read-LineValue "请选择浏览器模式 [1]: ").ToLowerInvariant()
+            if ($selected -in @("", "1", "playwright", "chromium")) {
+                return "playwright"
+            }
+            if ($selected -in @("2", "camoufox")) {
+                return "camoufox"
+            }
+            throw "请输入 1/2 或 playwright/camoufox。"
+        }
+        default { throw "不支持的浏览器模式: $RequestedMode" }
+    }
 }
 
 function Load-StartConfig([string]$Path) {
@@ -345,7 +366,7 @@ function Wait-PythonGracefulShutdown($Process, [int]$GraceSeconds) {
     }
 
     Write-Host ""
-    Write-Info "收到 Ctrl+C，已通知 Python 停止；等待 Python 停止新任务并关闭当前 Playwright 浏览器..."
+    Write-Info "收到 Ctrl+C，已通知 Python 停止；等待 Python 停止新任务并关闭当前 $BrowserDisplayName 浏览器..."
     $deadline = [DateTime]::UtcNow.AddSeconds($GraceSeconds)
     while (-not $Process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 200
@@ -356,7 +377,7 @@ function Wait-PythonGracefulShutdown($Process, [int]$GraceSeconds) {
         return $true
     }
 
-    Write-Info "Python 未在 ${GraceSeconds}s 内退出，强制终止 Python 子进程及其浏览器进程..."
+    Write-Info "Python 未在 ${GraceSeconds}s 内退出，强制终止 Python 子进程及其 $BrowserDisplayName 浏览器进程..."
     Stop-ProcessTree -ProcessId $Process.Id
     return $false
 }
@@ -383,7 +404,7 @@ function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
     $handler = $null
     $script:InvokePythonExitCode = 130
     $script:CancelRequested = $false
-    $stopFilePath = Join-Path ([System.IO.Path]::GetTempPath()) ("qwen-register-stop-{0}.signal" -f ([guid]::NewGuid().ToString("N")))
+    $stopFilePath = Join-Path ([System.IO.Path]::GetTempPath()) ("qwen-register-$BrowserMode-stop-{0}.signal" -f ([guid]::NewGuid().ToString("N")))
     try {
         $handler = [ConsoleCancelEventHandler]{
             param($sender, $eventArgs)
@@ -442,7 +463,7 @@ function Invoke-Python([string]$PythonExe, [string[]]$Arguments) {
 }
 
 function Invoke-InterruptCleanupSelfTest {
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("qwen-start-interrupt-selftest-{0}" -f ([guid]::NewGuid().ToString("N")))
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("qwen-start-$BrowserMode-interrupt-selftest-{0}" -f ([guid]::NewGuid().ToString("N")))
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
     $childPath = Join-Path $tempDir "child.py"
     $stopFilePath = Join-Path $tempDir "stop.signal"
@@ -509,7 +530,7 @@ raise SystemExit(130)
     }
 }
 
-function Ensure-PythonDependencies([string]$PythonExe) {
+function Ensure-PythonDependencies([string]$PythonExe, [string]$SelectedMode) {
     if ($SkipDependencyInstall) {
         Write-Info "已跳过依赖安装检测 (-SkipDependencyInstall)"
         return
@@ -518,11 +539,20 @@ function Ensure-PythonDependencies([string]$PythonExe) {
         throw "缺少 requirements.txt: $RequirementsPath"
     }
 
+    $modules = @("httpx", "bs4", "lxml", "portalocker", "playwright", "ddddocr")
+    if ($SelectedMode -eq "camoufox") {
+        $modules += "camoufox"
+    }
     $checkCode = @'
 import importlib.util
+import importlib.metadata
 import sys
-modules = ["httpx", "bs4", "lxml", "portalocker", "playwright", "ddddocr"]
+modules = sys.argv[1:]
 missing = [name for name in modules if importlib.util.find_spec(name) is None]
+if "playwright" not in missing:
+    version = importlib.metadata.version("playwright")
+    if tuple(int(part) for part in version.split(".")[:2]) >= (1, 60):
+        missing.append(f"playwright {version}（需要 <1.60.0）")
 if missing:
     print(",".join(missing))
     sys.exit(1)
@@ -530,46 +560,61 @@ if missing:
     $checkFile = [System.IO.Path]::GetTempFileName() + ".py"
     Set-Content -LiteralPath $checkFile -Value $checkCode -Encoding UTF8
     try {
-        $missingOutput = & $PythonExe $checkFile 2>&1
+        $missingOutput = & $PythonExe $checkFile @modules 2>&1
         $missingExit = $LASTEXITCODE
     } finally {
         Remove-Item -LiteralPath $checkFile -Force -ErrorAction SilentlyContinue
     }
 
     if ($missingExit -ne 0) {
-        Write-Info "检测到缺失依赖: $missingOutput"
+        Write-Info "检测到缺失或版本不兼容的依赖: $missingOutput"
         Invoke-Checked $PythonExe @("-m", "pip", "install", "-r", $RequirementsPath) "安装 Python 依赖失败"
     } else {
         Write-Info "Python 依赖已满足"
     }
 }
 
-function Ensure-PlaywrightChromium([string]$PythonExe) {
+function Ensure-BrowserRuntime([string]$PythonExe, [string]$SelectedMode) {
     if ($SkipDependencyInstall) {
         return
     }
 
-    $checkCode = @'
+    if ($SelectedMode -eq "camoufox") {
+        $checkCode = @'
+from camoufox.pkgman import installed_verstr
+try:
+    installed_verstr()
+    raise SystemExit(0)
+except FileNotFoundError:
+    raise SystemExit(1)
+'@
+        $installArgs = @("-m", "camoufox", "fetch")
+        $installLabel = "Camoufox 浏览器"
+    } else {
+        $checkCode = @'
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     executable = Path(p.chromium.executable_path)
     raise SystemExit(0 if executable.exists() else 1)
 '@
+        $installArgs = @("-m", "playwright", "install", "chromium")
+        $installLabel = "Playwright Chromium"
+    }
     $checkFile = [System.IO.Path]::GetTempFileName() + ".py"
     Set-Content -LiteralPath $checkFile -Value $checkCode -Encoding UTF8
     try {
         & $PythonExe $checkFile | Out-Null
-        $chromiumExit = $LASTEXITCODE
+        $browserExit = $LASTEXITCODE
     } finally {
         Remove-Item -LiteralPath $checkFile -Force -ErrorAction SilentlyContinue
     }
 
-    if ($chromiumExit -ne 0) {
-        Write-Info "安装 Playwright Chromium"
-        Invoke-Checked $PythonExe @("-m", "playwright", "install", "chromium") "安装 Playwright Chromium 失败"
+    if ($browserExit -ne 0) {
+        Write-Info "安装 $installLabel"
+        Invoke-Checked $PythonExe $installArgs "安装 $installLabel 失败"
     } else {
-        Write-Info "Playwright Chromium 已可用"
+        Write-Info "$installLabel 已可用"
     }
 }
 
@@ -577,25 +622,35 @@ function Format-CommandForDisplay([string[]]$Arguments) {
     return ($Arguments -join " ")
 }
 
-if ($InterruptCleanupSelfTest) {
-    try {
-        exit (Invoke-InterruptCleanupSelfTest)
-    } catch {
-        Write-Error $_.Exception.Message
-        exit 1
-    }
-}
-
 try {
     Set-Location -LiteralPath $ProjectRoot
 
+    $BrowserMode = Select-BrowserMode $Mode
+    if ($BrowserMode -eq "camoufox") {
+        $EntryScript = "qwenv4_camoufox.py"
+        $DefaultConfigName = ".start-camoufox-config.json"
+        $LogName = "qwenv4-camoufox.log"
+        $BrowserDisplayName = "Camoufox"
+    } else {
+        $EntryScript = "qwenv4.py"
+        $DefaultConfigName = ".start-config.json"
+        $LogName = "qwenv4.log"
+        $BrowserDisplayName = "Playwright"
+    }
+    $ResolvedConfigPath = Resolve-ProjectPath $ConfigPath $DefaultConfigName
+    $ScriptPath = Join-Path $ProjectRoot $EntryScript
+
+    if ($InterruptCleanupSelfTest) {
+        exit (Invoke-InterruptCleanupSelfTest)
+    }
+
     if (-not (Test-Path -LiteralPath $ScriptPath)) {
-        throw "缺少 qwenv4.py: $ScriptPath"
+        throw "缺少 ${EntryScript}: $ScriptPath"
     }
 
     $pythonExe = Ensure-VenvPython
-    Ensure-PythonDependencies $pythonExe
-    Ensure-PlaywrightChromium $pythonExe
+    Ensure-PythonDependencies $pythonExe $BrowserMode
+    Ensure-BrowserRuntime $pythonExe $BrowserMode
 
     $config = Load-StartConfig $ResolvedConfigPath
 
@@ -621,7 +676,7 @@ try {
     }
     $strict = Prompt-Bool "严格模式?" ([bool]$config.strict)
     if (-not $strict) {
-        Write-Host "⚠️  qwenv4.py 当前不支持关闭严格模式，将继续启用。"
+        Write-Host "⚠️  $EntryScript 当前不支持关闭严格模式，将继续启用。"
         $strict = $true
     }
 
@@ -644,9 +699,9 @@ try {
     Write-Info "已保存本次参数: $ResolvedConfigPath"
 
     $logDir = Join-Path $ProjectRoot "logs"
-    $logFile = Join-Path $logDir "qwenv4.log"
+    $logFile = Join-Path $logDir $LogName
 
-    $scriptArgs = @("qwenv4.py", [string]$count, "--email-provider", $provider)
+    $scriptArgs = @($EntryScript, [string]$count, "--email-provider", $provider)
     if (-not [string]::IsNullOrWhiteSpace($apiProxy)) {
         $scriptArgs += @("--api-proxy", $apiProxy)
     }
@@ -681,7 +736,7 @@ try {
     $displayCommand = Format-CommandForDisplay $scriptArgs
     Write-Host "最终命令: $displayCommand"
     if ($DryRun) {
-        Write-Info "试运行模式（DryRun）已启用，不启动 qwenv4.py"
+        Write-Info "试运行模式（DryRun）已启用，不启动 $EntryScript"
         exit 0
     }
 

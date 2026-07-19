@@ -10,7 +10,7 @@ from packaging.requirements import Requirement
 from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
-START_SCRIPT = ROOT / "start_camoufox.ps1"
+START_SCRIPT = ROOT / "start.ps1"
 POWERSHELL = shutil.which("powershell") or shutil.which("pwsh")
 
 pytestmark = pytest.mark.skipif(POWERSHELL is None, reason="PowerShell is not available")
@@ -29,6 +29,8 @@ def run_start(input_text: str, config_path: Path, *, captcha_ai_key: str | None 
             "Bypass",
             "-File",
             str(START_SCRIPT),
+            "-Mode",
+            "camoufox",
             "-DryRun",
             "-SkipDependencyInstall",
             "-ConfigPath",
@@ -69,13 +71,13 @@ def expected_defaults() -> dict:
     }
 
 
-def test_start_camoufox_ps1_has_valid_powershell_syntax():
+def test_start_ps1_camoufox_mode_has_valid_powershell_syntax():
     result = subprocess.run(
         [
             POWERSHELL,
             "-NoProfile",
             "-Command",
-            "[scriptblock]::Create((Get-Content -Raw .\\start_camoufox.ps1)) | Out-Null",
+            "[scriptblock]::Create((Get-Content -Raw .\\start.ps1)) | Out-Null",
         ],
         text=True,
         capture_output=True,
@@ -124,7 +126,7 @@ def test_start_camoufox_ps1_saves_and_reuses_values(tmp_path):
 
 
 def test_start_camoufox_ps1_executes_camoufox_entry_and_streams_output(tmp_path):
-    temp_script = tmp_path / "start_camoufox.ps1"
+    temp_script = tmp_path / "start.ps1"
     temp_config = tmp_path / "start-camoufox-config.json"
     temp_script.write_text(START_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
     (tmp_path / "qwenv4_camoufox.py").write_text(
@@ -145,6 +147,8 @@ sys.exit(7)
             "Bypass",
             "-File",
             str(temp_script),
+            "-Mode",
+            "camoufox",
             "-SkipDependencyInstall",
             "-ConfigPath",
             str(temp_config),
@@ -170,6 +174,8 @@ def test_start_camoufox_ps1_interrupt_cleanup_selftest_notifies_python_before_ki
             "Bypass",
             "-File",
             str(START_SCRIPT),
+            "-Mode",
+            "camoufox",
             "-SkipDependencyInstall",
             "-InterruptCleanupSelfTest",
         ],

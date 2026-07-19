@@ -14,24 +14,35 @@ POWERSHELL = shutil.which("powershell") or shutil.which("pwsh")
 pytestmark = pytest.mark.skipif(POWERSHELL is None, reason="PowerShell is not available")
 
 
-def run_start(input_text: str, config_path: Path, *, captcha_ai_key: str | None = None) -> subprocess.CompletedProcess[str]:
+def run_start(
+    input_text: str,
+    config_path: Path,
+    *,
+    captcha_ai_key: str | None = None,
+    mode: str | None = "playwright",
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("CAPTCHA_AI_API_KEY", None)
     if captcha_ai_key is not None:
         env["CAPTCHA_AI_API_KEY"] = captcha_ai_key
+    command = [
+        POWERSHELL,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(START_SCRIPT),
+    ]
+    if mode is not None:
+        command += ["-Mode", mode]
+    command += [
+        "-DryRun",
+        "-SkipDependencyInstall",
+        "-ConfigPath",
+        str(config_path),
+    ]
     return subprocess.run(
-        [
-            POWERSHELL,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(START_SCRIPT),
-            "-DryRun",
-            "-SkipDependencyInstall",
-            "-ConfigPath",
-            str(config_path),
-        ],
+        command,
         input=input_text,
         text=True,
         capture_output=True,
@@ -95,6 +106,15 @@ def test_start_ps1_uses_builtin_defaults_and_saves_config(tmp_path):
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved == expected_defaults()
     assert "captcha_ai_api_key" not in saved
+
+
+def test_start_ps1_interactive_mode_can_select_camoufox(tmp_path):
+    config_path = tmp_path / "start-camoufox-config.json"
+    result = run_start("2\n" + "\n" * 9, config_path, mode=None)
+
+    assert_success(result)
+    assert "qwenv4_camoufox.py" in without_log_arg(result.stdout)
+    assert "logs/qwenv4-camoufox.log" in result.stdout.replace("\\", "/")
 
 
 def test_start_ps1_saves_custom_values_then_reuses_them_as_defaults(tmp_path):
@@ -183,6 +203,8 @@ Path('launched.json').write_text(json.dumps({'argv': sys.argv[1:]}, ensure_ascii
             "Bypass",
             "-File",
             str(temp_script),
+            "-Mode",
+            "playwright",
             "-SkipDependencyInstall",
             "-ConfigPath",
             str(temp_config),
@@ -242,6 +264,8 @@ sys.exit(7)
             "Bypass",
             "-File",
             str(temp_script),
+            "-Mode",
+            "playwright",
             "-SkipDependencyInstall",
             "-ConfigPath",
             str(temp_config),
@@ -267,6 +291,8 @@ def test_start_ps1_interrupt_cleanup_selftest_notifies_python_before_kill():
             "Bypass",
             "-File",
             str(START_SCRIPT),
+            "-Mode",
+            "playwright",
             "-SkipDependencyInstall",
             "-InterruptCleanupSelfTest",
         ],
