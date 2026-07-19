@@ -55,6 +55,13 @@ class StartShTest(unittest.TestCase):
             self.assertIn("logs/qwenv4-camoufox.log", result.stdout)
             self.assertEqual(1, json.loads(config_path.read_text())["concurrency"])
 
+    def test_camoufox_mode_rejects_incompatible_playwright(self) -> None:
+        """Camoufox 模式应检测 Playwright 1.60 以上版本。"""
+        source = START_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('"camoufox" in sys.argv[1:]', source)
+        self.assertIn('>= (1, 60)', source)
+
 
 if __name__ == "__main__":
     unittest.main()

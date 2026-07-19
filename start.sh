@@ -151,14 +151,19 @@ ensure_python_dependencies() {
     [[ "$browser_mode" == "camoufox" ]] && modules+=(camoufox)
     if ! "$python_exe" - "${modules[@]}" <<'PY'
 import importlib.util
+import importlib.metadata
 import sys
 missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]
+if "camoufox" in sys.argv[1:] and "playwright" not in missing:
+    version = importlib.metadata.version("playwright")
+    if tuple(int(part) for part in version.split(".")[:2]) >= (1, 60):
+        missing.append(f"playwright {version}（需要 <1.60.0）")
 if missing:
     print(",".join(missing))
     raise SystemExit(1)
 PY
     then
-        info '检测到缺失依赖，安装 requirements.txt'
+        info '检测到缺失或版本不兼容的依赖，安装 requirements.txt'
         "$python_exe" -m pip install -r "$REQUIREMENTS_PATH" || { printf '安装 Python 依赖失败\n' >&2; exit 1; }
     else
         info 'Python 依赖已满足'
