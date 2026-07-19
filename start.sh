@@ -182,8 +182,23 @@ except FileNotFoundError:
     raise SystemExit(1)
 PY
         then
-            info '安装 Camoufox 浏览器'
-            "$python_exe" -m camoufox fetch || { printf '安装 Camoufox 浏览器失败\n' >&2; exit 1; }
+            info '首次安装需下载约 298 MiB 的 Camoufox 浏览器'
+            local fetch_proxy="${CAMOUFOX_FETCH_PROXY:-}"
+            if [[ -z "$fetch_proxy" && -n "$browser_proxy" ]]; then
+                local use_proxy
+                read -r -p "使用已配置的浏览器代理加速下载? [Y/n]: " use_proxy || use_proxy=""
+                if [[ -z "$use_proxy" || "${use_proxy,,}" =~ ^(y|yes)$ ]]; then
+                    fetch_proxy="${browser_proxy//\{uuid\}/$("$python_exe" -c 'import uuid; print(uuid.uuid4().hex)')}"
+                fi
+            fi
+            if [[ -n "$fetch_proxy" ]]; then
+                info '通过代理下载 Camoufox 浏览器'
+                HTTPS_PROXY="$fetch_proxy" HTTP_PROXY="$fetch_proxy" RICH_FORCE_TERMINAL=1 \
+                    "$python_exe" -m camoufox fetch || { printf '安装 Camoufox 浏览器失败\n' >&2; exit 1; }
+            else
+                info '直接下载 Camoufox 浏览器；如速度过慢，可设置 CAMOUFOX_FETCH_PROXY'
+                RICH_FORCE_TERMINAL=1 "$python_exe" -m camoufox fetch || { printf '安装 Camoufox 浏览器失败\n' >&2; exit 1; }
+            fi
         else
             info 'Camoufox 浏览器已可用'
         fi
@@ -513,8 +528,8 @@ main() {
         exit $?
     fi
     ensure_python_dependencies
-    ensure_browser_runtime
     load_config
+    ensure_browser_runtime
     prompt_run_config
     save_config || exit 1
     info "已保存本次参数: $resolved_config_path"

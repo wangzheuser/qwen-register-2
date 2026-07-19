@@ -62,6 +62,13 @@ class StartShTest(unittest.TestCase):
         self.assertIn('"camoufox" in sys.argv[1:]', source)
         self.assertIn('>= (1, 60)', source)
 
+    def test_camoufox_download_can_use_configured_proxy(self) -> None:
+        """首次下载 Camoufox 时应支持复用浏览器代理。"""
+        source = START_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("CAMOUFOX_FETCH_PROXY", source)
+        self.assertIn('HTTPS_PROXY="$fetch_proxy"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
