@@ -520,9 +520,15 @@ function Ensure-PythonDependencies([string]$PythonExe) {
 
     $checkCode = @'
 import importlib.util
+import importlib.metadata
 import sys
 modules = ["httpx", "bs4", "lxml", "portalocker", "playwright", "camoufox", "ddddocr"]
 missing = [name for name in modules if importlib.util.find_spec(name) is None]
+if "playwright" not in missing:
+    version = importlib.metadata.version("playwright")
+    major_minor = tuple(int(part) for part in version.split(".")[:2])
+    if major_minor >= (1, 60):
+        missing.append(f"playwright {version}（需要 <1.60.0）")
 if missing:
     print(",".join(missing))
     sys.exit(1)
@@ -537,7 +543,7 @@ if missing:
     }
 
     if ($missingExit -ne 0) {
-        Write-Info "检测到缺失依赖: $missingOutput"
+        Write-Info "检测到缺失或版本不兼容的依赖: $missingOutput"
         Invoke-Checked $PythonExe @("-m", "pip", "install", "-r", $RequirementsPath) "安装 Python 依赖失败"
     } else {
         Write-Info "Python 依赖已满足"

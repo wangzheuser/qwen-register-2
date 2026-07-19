@@ -76,6 +76,32 @@ def test_camoufox_account_timeout_default_allows_slow_verification_cleanup(monke
     assert args.camoufox_account_timeout == 180
 
 
+def test_camoufox_new_page_idle_timeout_allows_observed_slow_start(monkeypatch):
+    import qwenv4_camoufox
+
+    monkeypatch.delenv("CAMOUFOX_STAGE_NEW_PAGE_IDLE_TIMEOUT", raising=False)
+
+    assert qwenv4_camoufox._camoufox_stage_idle_timeout("new_page", 180) == 45
+
+
+def test_camoufox_manual_timeout_cannot_be_shorter_than_captcha_wait():
+    import qwenv4_camoufox
+
+    args = qwenv4_camoufox.parse_args(
+        [
+            "1",
+            "--captcha-solver",
+            "manual",
+            "--captcha-timeout",
+            "600",
+            "--camoufox-account-timeout",
+            "180",
+        ]
+    )
+
+    assert qwenv4_camoufox._effective_camoufox_account_timeout(args) == 660
+
+
 def test_camoufox_worker_uses_camoufox_without_chromium_args(monkeypatch, tmp_path):
     import qwenv4_camoufox
 

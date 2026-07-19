@@ -247,7 +247,7 @@ def _camoufox_stage_idle_timeout(stage: str, default_timeout: float) -> float:
     """按子进程阶段返回更细粒度空闲超时，避免 new_page 卡死等满账号总超时。"""
     normalized = (stage or "").strip().lower()
     env_map = {
-        "new_page": ("CAMOUFOX_STAGE_NEW_PAGE_IDLE_TIMEOUT", 20.0),
+        "new_page": ("CAMOUFOX_STAGE_NEW_PAGE_IDLE_TIMEOUT", 45.0),
         "launch": ("CAMOUFOX_STAGE_LAUNCH_IDLE_TIMEOUT", 45.0),
     }
     if normalized not in env_map:
@@ -261,11 +261,18 @@ def _camoufox_stage_idle_timeout(stage: str, default_timeout: float) -> float:
     return min(float(default_timeout), value)
 
 
+def _effective_camoufox_account_timeout(args) -> float:
+    timeout = float(getattr(args, "camoufox_account_timeout", 180) or 180)
+    if getattr(args, "captcha_solver", "ddddocr") in {"ai", "manual"}:
+        timeout = max(timeout, float(getattr(args, "captcha_timeout", 600) or 600) + 60.0)
+    return timeout
+
+
 def run_account_subprocess(account_index, total_accounts, args, proxy_str=None, timeout_seconds=None):
     """用独立 Python 子进程执行一个 Camoufox 账号，隔离 Camoufox driver 卡死。"""
     started_at = time.perf_counter()
     label = f"[账号 {account_index}/{total_accounts}]"
-    timeout = float(timeout_seconds or getattr(args, "camoufox_account_timeout", 180) or 180)
+    timeout = float(timeout_seconds) if timeout_seconds is not None else _effective_camoufox_account_timeout(args)
     max_attempts = max(1, int(getattr(args, "account_retries", 1) or 1))
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"

@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 START_SCRIPT = ROOT / "start_camoufox.ps1"
@@ -82,6 +84,18 @@ def test_start_camoufox_ps1_has_valid_powershell_syntax():
     )
 
     assert_success(result)
+
+
+def test_requirements_keep_playwright_compatible_with_camoufox_firefox():
+    requirements = [
+        Requirement(line)
+        for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    playwright = next(requirement for requirement in requirements if requirement.name == "playwright")
+
+    assert Version("1.59.0") in playwright.specifier
+    assert Version("1.60.0") not in playwright.specifier
 
 
 def test_start_camoufox_ps1_uses_defaults_and_saves_separate_config(tmp_path):

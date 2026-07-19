@@ -44,6 +44,44 @@ def _sanitize_queue_label(label: str) -> str:
     return text[:48] or "slider"
 
 
+def _pid_is_running(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        open_process.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        handle = open_process(0x1000, False, pid)
+        if handle:
+            close_handle(handle)
+            return True
+        return ctypes.get_last_error() == 5
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _remove_dead_slider_tickets(queue_dir: Path, current_ticket: Path) -> None:
+    for queued_ticket in queue_dir.glob("*.ticket"):
+        if queued_ticket == current_ticket:
+            continue
+        try:
+            owner_pid = int(queued_ticket.name.split("-", 3)[1])
+        except (IndexError, ValueError):
+            continue
+        if not _pid_is_running(owner_pid):
+            queued_ticket.unlink(missing_ok=True)
+
+
 class SliderLockTimeout(RuntimeError):
     """等待滑块锁被取消或超时。"""
 
@@ -258,6 +296,7 @@ def _acquire_slider_file_queue_turn(
             if _cancelled(stop_event):
                 raise SliderLockTimeout("等待跨进程滑块队列时收到停止请求")
             try:
+                _remove_dead_slider_tickets(queue_dir, ticket)
                 tickets = sorted(queue_dir.glob("*.ticket"), key=lambda path: path.name)
             except Exception:
                 tickets = [ticket]

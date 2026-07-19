@@ -75,7 +75,13 @@ def test_force_resyncs_successful_accounts(tmp_path, monkeypatch):
                 "password": "p2",
                 "token": "token-done",
                 "qwen2api_sync": {"status": "success"},
-            }
+            },
+            {
+                "email": "done2@example.com",
+                "password": "p3",
+                "token": "token-done2",
+                "qwen2api_sync": {"status": "success"},
+            },
         ],
     )
     calls = []
@@ -86,10 +92,11 @@ def test_force_resyncs_successful_accounts(tmp_path, monkeypatch):
 
     monkeypatch.setattr(resync, "sync_account_to_qwen2api", fake_sync_account_to_qwen2api)
 
-    assert resync.main(["--accounts-file", str(accounts_path), "--force"]) == 0
+    assert resync.main(["--accounts-file", str(accounts_path), "--force", "--workers", "2"]) == 0
 
-    assert calls == ["done@example.com"]
+    assert set(calls) == {"done@example.com", "done2@example.com"}
     assert read_accounts(accounts_path)[0]["qwen2api_sync"]["status"] == "success"
+    assert read_accounts(accounts_path)[1]["qwen2api_sync"]["status"] == "success"
 
 
 def test_failure_result_is_written_back_and_returns_nonzero(tmp_path, monkeypatch):

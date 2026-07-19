@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -86,6 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--qwen2api-timeout", type=positive_int, default=DEFAULT_QWEN2API_TIMEOUT, help="同步请求超时秒数")
     parser.add_argument("--force", action="store_true", help="强制重新同步所有有 token 的账号")
     parser.add_argument("--dry-run", action="store_true", help="只打印将同步账号，不发请求也不写文件")
+    parser.add_argument("--workers", type=positive_int, default=1, help="并发同步数，默认: 1")
     return parser.parse_args(argv)
 
 
@@ -144,7 +146,14 @@ def build_sync_state(result: Qwen2ApiSyncResult, *, synced_at: str | None = None
     }
 
 
-def sync_accounts(accounts: list[dict[str, Any]], *, config: Qwen2ApiSyncConfig, force: bool = False, dry_run: bool = False) -> SyncSummary:
+def sync_accounts(
+    accounts: list[dict[str, Any]],
+    *,
+    config: Qwen2ApiSyncConfig,
+    force: bool = False,
+    dry_run: bool = False,
+    workers: int = 1,
+) -> SyncSummary:
     summary = SyncSummary(total=len(accounts))
     pending_indexes = [index for index, account in enumerate(accounts) if should_sync_account(account, force=force)]
     summary.pending = len(pending_indexes)
@@ -157,23 +166,28 @@ def sync_accounts(accounts: list[dict[str, Any]], *, config: Qwen2ApiSyncConfig,
             print(f"  - {account.get('email') or '<missing-email>'}")
         return summary
 
-    for index in pending_indexes:
+    def sync_one(index: int) -> tuple[int, Qwen2ApiSyncResult]:
         account = accounts[index]
         email = str(account.get("email") or "").strip()
         password = str(account.get("password") or "")
         token = str(account.get("token") or "").strip()
-        print(f"  🔁 同步 qwen2API: {email}")
-        result = sync_account_to_qwen2api(email=email, password=password, token=token, config=config)
-        account["qwen2api_sync"] = build_sync_state(result)
-        if result.ok:
-            summary.success += 1
-            print(f"  ✅ {result.message}")
-        elif result.skipped:
-            summary.skipped += 1
-            print(f"  ⚠️ {result.message}")
-        else:
-            summary.failed += 1
-            print(f"  ❌ qwen2API 同步失败: {result.message}")
+        return index, sync_account_to_qwen2api(email=email, password=password, token=token, config=config)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(sync_one, index) for index in pending_indexes]
+        for future in as_completed(futures):
+            index, result = future.result()
+            account = accounts[index]
+            account["qwen2api_sync"] = build_sync_state(result)
+            if result.ok:
+                summary.success += 1
+                print(f"  ✅ {result.message}")
+            elif result.skipped:
+                summary.skipped += 1
+                print(f"  ⚠️ {result.message}")
+            else:
+                summary.failed += 1
+                print(f"  ❌ qwen2API 同步失败: {result.message}")
 
     return summary
 
@@ -200,7 +214,13 @@ def main(argv: list[str] | None = None) -> int:
 
     with accounts_file_lock(accounts_path):
         accounts = load_accounts(accounts_path)
-        summary = sync_accounts(accounts, config=config, force=bool(args.force), dry_run=bool(args.dry_run))
+        summary = sync_accounts(
+            accounts,
+            config=config,
+            force=bool(args.force),
+            dry_run=bool(args.dry_run),
+            workers=args.workers,
+        )
         if not args.dry_run:
             save_accounts(accounts_path, accounts)
 

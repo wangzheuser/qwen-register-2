@@ -1185,7 +1185,7 @@ def test_initial_failure_wait_default_is_short_for_fast_retry(monkeypatch):
 
     monkeypatch.delenv("CAPTCHA_INITIAL_FAILURE_WAIT_SECONDS", raising=False)
 
-    assert ai_slider._captcha_initial_failure_wait_seconds() == pytest.approx(1.7)
+    assert ai_slider._captcha_initial_failure_wait_seconds() == pytest.approx(2.1)
 
 
 def test_ddddocr_plan_uses_slide_match_result(monkeypatch):

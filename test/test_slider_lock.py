@@ -370,6 +370,27 @@ def test_slider_file_queue_is_fifo_across_independent_waiters(tmp_path):
 
     assert entered == ["[跨进程滑块1]", "[跨进程滑块2]"]
 
+
+def test_slider_file_queue_removes_ticket_from_dead_process(tmp_path, monkeypatch):
+    from captcha_solvers import slider_lock
+
+    lock_path = tmp_path / "stale-ticket.lock"
+    queue_dir = slider_lock._slider_file_queue_path(lock_path)
+    queue_dir.mkdir(parents=True)
+    stale_ticket = queue_dir / "00000000000000000001-999999-1-stale.ticket"
+    stale_ticket.write_text("0", encoding="utf-8")
+    monkeypatch.setattr(slider_lock, "_pid_is_running", lambda pid: pid != 999999, raising=False)
+
+    with slider_lock._acquire_slider_file_queue_turn(
+        label="[当前滑块]",
+        lock_path=lock_path,
+        stop_event=None,
+        poll_interval=0.005,
+        file_lock_timeout=0.1,
+    ):
+        assert not stale_ticket.exists()
+
+
 def test_window_lock_does_not_probe_cross_process_slider_intent(tmp_path, monkeypatch):
     from captcha_solvers import slider_lock
 
