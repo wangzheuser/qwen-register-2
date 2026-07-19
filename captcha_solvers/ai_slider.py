@@ -14,7 +14,9 @@ import math
 import os
 import random
 import re
+import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -36,6 +38,7 @@ ALIYUN_PUZZLE_MOVE_RATIO = 0.94
 ALIYUN_AI_DISTANCE_FACTOR = 1.10
 _DDDDOCR_SLIDE: Optional[Any] = None
 _DDDDOCR_LOAD_FAILED = False
+_DDDDOCR_LOCK = threading.Lock()
 
 _DISTANCE_PROMPT = """
 你正在本地授权靶场中分析一个滑块验证码截图。请只完成视觉测量任务：
@@ -160,6 +163,7 @@ def solve_slider_captcha(
     image_dir: str = "images",
     client: Optional[CaptchaAiClient] = None,
     stop_event: Optional[Any] = None,
+    drag_guard: Optional[Any] = None,
 ) -> CaptchaSolverResult:
     """尝试在当前 Playwright 页面上处理滑块验证码。"""
     prefix = f"{label} " if label else ""
@@ -202,6 +206,20 @@ def solve_slider_captcha(
             mode_text = "ddddocr" if mode == "ddddocr" else "AI"
             print(f"  🤖 {prefix}{mode_text} 正在尝试处理滑块（第 {attempt}/{config.attempts} 次）")
             root = _find_captcha_root(page)
+            if root is None and drag_guard is not None:
+                with drag_guard() as drag_ready:
+                    if drag_ready:
+                        root = _find_captcha_root(page)
+                    elif _captcha_solved(page):
+                        return CaptchaSolverResult(
+                            ok=True,
+                            message="验证码已在等待聚焦期间完成",
+                            attempts=attempt - 1,
+                        )
+                if root is None and not _captcha_solved(page):
+                    last_message = "聚焦后未检测到可见滑块验证码"
+                    consumed_attempts += 1
+                    continue
             if root is None:
                 return CaptchaSolverResult(ok=True, message="未检测到可见滑块验证码", attempts=attempt - 1)
 
@@ -257,7 +275,7 @@ def solve_slider_captcha(
                 _sleep(0.5, stop_event)
                 continue
 
-            screenshot_path = str(Path(image_dir) / f"captcha_ai_{int(time.time() * 1000)}_{attempt}.png")
+            screenshot_path = str(Path(image_dir) / f"captcha_ai_{os.getpid()}_{time.time_ns()}_{attempt}.png")
             try:
                 _screenshot_locator(root, screenshot_path)
             except Exception as screenshot_exc:
@@ -432,12 +450,29 @@ def solve_slider_captcha(
             if _is_cancelled(stop_event):
                 return CaptchaSolverResult(ok=False, message="AI 滑块处理已取消", attempts=attempt - 1)
 
-            actual_distance = _perform_drag_with_focus_retry(
-                page,
-                drag_plan,
-                prefix=prefix,
-                stop_event=stop_event,
-            )
+            guard = drag_guard() if drag_guard is not None else nullcontext(True)
+            with guard as drag_ready:
+                if not drag_ready:
+                    if _captcha_solved(page):
+                        return CaptchaSolverResult(
+                            ok=True,
+                            message="验证码已在等待拖动期间完成",
+                            attempts=attempt - 1,
+                            screenshot_path=last_screenshot,
+                        )
+                    raise RuntimeError("滑块窗口焦点确认失败")
+                actual_distance = _perform_drag_with_focus_retry(
+                    page,
+                    drag_plan,
+                    prefix=prefix,
+                    stop_event=stop_event,
+                )
+                success_source = _wait_for_captcha_success(
+                    page,
+                    network_debug,
+                    stop_event=stop_event,
+                    timeout=_captcha_success_wait_seconds(),
+                )
             last_distance = int(round(actual_distance))
             adjustment = drag_plan.get("local_adjustment")
             if adjustment:
@@ -510,12 +545,6 @@ def solve_slider_captcha(
                     except Exception:
                         pass
             print(f"  🖱️ {prefix}实际拖动距离: {last_distance}px")
-            success_source = _wait_for_captcha_success(
-                page,
-                network_debug,
-                stop_event=stop_event,
-                timeout=_captcha_success_wait_seconds(),
-            )
             if success_source:
                 success_message = "AI 滑块处理成功"
                 if success_source != "页面":
@@ -1538,6 +1567,9 @@ def _find_captcha_root(page: Any):
     selectors = [
         "#waf_nc_block",
         ".geetest_window",
+        "[id*='nc_']",
+        "[class*='nc_']",
+        "[class*='btn_slide']",
         "[class*='captcha']",
         "[class*='Captcha']",
     ]
@@ -2015,36 +2047,37 @@ def _ddddocr_target_x(
     puzzle: Any,
     content_bbox: tuple[int, int, int, int],
 ) -> Optional[float]:
-    slide = _get_ddddocr_slide()
-    if slide is None:
-        return None
-    try:
-        standard = slide.slide_match(
-            _image_to_png_bytes(puzzle),
-            _image_to_png_bytes(bg),
-            simple_target=False,
-        )
-        standard_candidate = _extract_ddddocr_candidate(standard, content_bbox)
-        if standard_candidate is None:
+    with _DDDDOCR_LOCK:
+        slide = _get_ddddocr_slide()
+        if slide is None:
             return None
-        standard_x, standard_confidence = standard_candidate
-        if standard_confidence >= 0.2:
-            return standard_x
+        try:
+            standard = slide.slide_match(
+                _image_to_png_bytes(puzzle),
+                _image_to_png_bytes(bg),
+                simple_target=False,
+            )
+            standard_candidate = _extract_ddddocr_candidate(standard, content_bbox)
+            if standard_candidate is None:
+                return None
+            standard_x, standard_confidence = standard_candidate
+            if standard_confidence >= 0.2:
+                return standard_x
 
-        simple = slide.slide_match(
-            _image_to_png_bytes(puzzle),
-            _image_to_png_bytes(bg),
-            simple_target=True,
-        )
-        simple_candidate = _extract_ddddocr_candidate(simple, content_bbox)
-        if simple_candidate is None:
+            simple = slide.slide_match(
+                _image_to_png_bytes(puzzle),
+                _image_to_png_bytes(bg),
+                simple_target=True,
+            )
+            simple_candidate = _extract_ddddocr_candidate(simple, content_bbox)
+            if simple_candidate is None:
+                return standard_x
+            simple_x, simple_confidence = simple_candidate
+            if simple_confidence > standard_confidence + 0.05:
+                return simple_x
             return standard_x
-        simple_x, simple_confidence = simple_candidate
-        if simple_confidence > standard_confidence + 0.05:
-            return simple_x
-        return standard_x
-    except Exception:
-        return None
+        except Exception:
+            return None
 
 
 def _extract_ddddocr_candidate(

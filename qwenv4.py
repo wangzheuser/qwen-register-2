@@ -18,6 +18,7 @@ import threading
 import signal
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
@@ -1544,101 +1545,121 @@ def register_qwen(
             if os.getenv("CAPTCHA_FORCE_VERIFY_SUCCESS", "").strip():
                 install_aliyun_verify_success_route(page)
             topmost_hwnd = None
-            try:
+            slider_window_minimized = False
+
+            def minimize_slider_window():
+                nonlocal slider_window_minimized
+                if slider_window_minimized:
+                    return True
+                if topmost_hwnd is not None:
+                    minimized = minimize_page_window(page, label=label, hwnd=topmost_hwnd)
+                else:
+                    minimized = minimize_page_window(page, label=label)
+                slider_window_minimized = bool(minimized)
+                return minimized
+
+            def ensure_slider_window_minimized():
+                if slider_window_minimized:
+                    return True
                 with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
+                    return minimize_slider_window()
+
+            @contextmanager
+            def focused_slider_guard():
+                nonlocal slider_window_minimized, topmost_hwnd
+                current_hwnd = None
+                minimize_before_release = False
+                with acquire_slider_lock(label=label, stop_event=STOP_EVENT):
+                    with hold_page_topmost(page, label=label) as topmost_ok:
+                        if not topmost_ok:
+                            yield False
+                            return
+                        current_hwnd = getattr(topmost_ok, "hwnd", None)
+                        topmost_hwnd = current_hwnd
+                        slider_window_minimized = False
+                        if not focus_page_for_slider(page, label=label):
+                            yield False
+                            return
+                        if not detect_captcha(page):
+                            minimize_before_release = True
+                            yield False
+                            return
+                        yield True
+                        minimize_before_release = not detect_captcha(page)
+                    if minimize_before_release:
+                        minimize_slider_window()
+
+            def complete_captcha_manually():
+                manual_trace_records = attach_manual_trace_recorder(
+                    page,
+                    label=label,
+                    image_dir=IMAGES_DIR,
+                )
+                captcha_completed = wait_for_captcha_completion(
+                    page,
+                    email,
+                    password,
+                    name,
+                    timeout=captcha_timeout,
+                )
+                dump_manual_trace_recording(
+                    page,
+                    manual_trace_records,
+                    label=label,
+                    image_dir=IMAGES_DIR,
+                )
+                return captcha_completed
+
+            try:
+                if captcha_solver_config is not None and captcha_solver_config.enabled:
                     try:
-                        with hold_page_topmost(page, label=label) as topmost_ok:
-                            if not topmost_ok:
-                                return False
-                            topmost_hwnd = getattr(topmost_ok, "hwnd", None)
-                            if not focus_page_for_slider(page, label=label):
-                                return False
-
-                            if not detect_captcha(page):
-                                print(f"  ✅ {label_prefix}验证码已在等待期间完成")
-                                post_captcha_submission_needed = True
-                            else:
-                                manual_trace_records = None
-                                if captcha_solver_config is not None and captcha_solver_config.enabled:
-                                    solver_result = solve_slider_captcha(
-                                        page,
-                                        captcha_solver_config,
-                                        label=label,
-                                        image_dir=IMAGES_DIR,
-                                        stop_event=STOP_EVENT,
-                                    )
-                                    if solver_result.ok:
-                                        print(f"  ✅ {label_prefix}{solver_result.message}")
-                                        post_captcha_submission_needed = True
-                                    elif captcha_solver_config.fallback_manual:
-                                        print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
-                                        manual_trace_records = attach_manual_trace_recorder(
-                                            page,
-                                            label=label,
-                                            image_dir=IMAGES_DIR,
-                                        )
-                                        captcha_completed = wait_for_captcha_completion(
-                                            page,
-                                            email,
-                                            password,
-                                            name,
-                                            timeout=captcha_timeout,
-                                        )
-                                        if not captcha_completed:
-                                            dump_manual_trace_recording(
-                                                page,
-                                                manual_trace_records,
-                                                label=label,
-                                                image_dir=IMAGES_DIR,
-                                            )
-                                            print("  ❌ 验证码未完成或超时")
-                                            return False
-                                        dump_manual_trace_recording(
-                                            page,
-                                            manual_trace_records,
-                                            label=label,
-                                            image_dir=IMAGES_DIR,
-                                        )
-                                        post_captcha_submission_needed = True
-                                    else:
-                                        print(f"  ❌ {label_prefix}{solver_result.message}")
-                                        return False
-                                else:
-                                    manual_trace_records = attach_manual_trace_recorder(
-                                        page,
-                                        label=label,
-                                        image_dir=IMAGES_DIR,
-                                    )
-                                    captcha_completed = wait_for_captcha_completion(
-                                        page,
-                                        email,
-                                        password,
-                                        name,
-                                        timeout=captcha_timeout,
-                                    )
-
-                                    if not captcha_completed:
-                                        dump_manual_trace_recording(
-                                            page,
-                                            manual_trace_records,
-                                            label=label,
-                                            image_dir=IMAGES_DIR,
-                                        )
-                                        print("  ❌ 验证码未完成或超时")
-                                        return False
-                                    dump_manual_trace_recording(
-                                        page,
-                                        manual_trace_records,
-                                        label=label,
-                                        image_dir=IMAGES_DIR,
-                                    )
-                                    post_captcha_submission_needed = True
+                        solver_result = solve_slider_captcha(
+                            page,
+                            captcha_solver_config,
+                            label=label,
+                            image_dir=IMAGES_DIR,
+                            stop_event=STOP_EVENT,
+                            drag_guard=focused_slider_guard,
+                        )
                     finally:
                         print(f"  🪟 {label_prefix}滑块阶段结束，正在最小化窗口", flush=True)
-                        if topmost_hwnd is not None:
-                            minimize_page_window(page, label=label, hwnd=topmost_hwnd)
-                        else:
-                            minimize_page_window(page, label=label)
+                        ensure_slider_window_minimized()
+                    if solver_result.ok:
+                        print(f"  ✅ {label_prefix}{solver_result.message}")
+                        post_captcha_submission_needed = True
+                    elif captcha_solver_config.fallback_manual:
+                        print(f"  ⚠️ {label_prefix}{solver_result.message}，改为人工处理")
+                        with focused_slider_guard() as ready:
+                            if not ready:
+                                if not detect_captcha(page):
+                                    post_captcha_submission_needed = True
+                                else:
+                                    return False
+                            elif complete_captcha_manually():
+                                post_captcha_submission_needed = True
+                            else:
+                                print("  ❌ 验证码未完成或超时")
+                                return False
+                    else:
+                        print(f"  ❌ {label_prefix}{solver_result.message}")
+                        return False
+                else:
+                    try:
+                        with focused_slider_guard() as ready:
+                            if not ready:
+                                if not detect_captcha(page):
+                                    print(f"  ✅ {label_prefix}验证码已在等待期间完成")
+                                    post_captcha_submission_needed = True
+                                else:
+                                    return False
+                            elif complete_captcha_manually():
+                                post_captcha_submission_needed = True
+                            else:
+                                print("  ❌ 验证码未完成或超时")
+                                return False
+                    finally:
+                        print(f"  🪟 {label_prefix}滑块阶段结束，正在最小化窗口", flush=True)
+                        ensure_slider_window_minimized()
             except SliderLockTimeout as e:
                 print(f"  🛑 {label_prefix}{e}")
                 return False
