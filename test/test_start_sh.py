@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,8 @@ class StartShTest(unittest.TestCase):
 
     def run_start(self, mode: str, config_path: Path) -> subprocess.CompletedProcess[str]:
         """以默认交互输入执行一次 dry-run。"""
+        if os.name == "nt":
+            self.skipTest("start.sh execution requires macOS or Linux")
         return subprocess.run(
             [
                 "bash",
