@@ -183,22 +183,14 @@ except FileNotFoundError:
 PY
         then
             info '首次安装需下载约 298 MiB 的 Camoufox 浏览器'
-            local fetch_proxy="${CAMOUFOX_FETCH_PROXY:-}"
-            if [[ -z "$fetch_proxy" && -n "$browser_proxy" ]]; then
-                local use_proxy
-                read -r -p "使用已配置的浏览器代理加速下载? [Y/n]: " use_proxy || use_proxy=""
-                if [[ -z "$use_proxy" || "${use_proxy,,}" =~ ^(y|yes)$ ]]; then
-                    fetch_proxy="${browser_proxy//\{uuid\}/$("$python_exe" -c 'import uuid; print(uuid.uuid4().hex)')}"
-                fi
+            local fetch_proxy="http://127.0.0.1:7890"
+            local github_token="${GITHUB_TOKEN:-}"
+            if [[ -z "$github_token" ]] && command -v gh >/dev/null 2>&1; then
+                github_token="$(gh auth token 2>/dev/null || true)"
             fi
-            if [[ -n "$fetch_proxy" ]]; then
-                info '通过代理下载 Camoufox 浏览器'
-                HTTPS_PROXY="$fetch_proxy" HTTP_PROXY="$fetch_proxy" RICH_FORCE_TERMINAL=1 \
-                    "$python_exe" -m camoufox fetch || { printf '安装 Camoufox 浏览器失败\n' >&2; exit 1; }
-            else
-                info '直接下载 Camoufox 浏览器；如速度过慢，可设置 CAMOUFOX_FETCH_PROXY'
-                RICH_FORCE_TERMINAL=1 "$python_exe" -m camoufox fetch || { printf '安装 Camoufox 浏览器失败\n' >&2; exit 1; }
-            fi
+            info "通过代理下载 Camoufox 浏览器: $fetch_proxy"
+            GITHUB_TOKEN="$github_token" HTTPS_PROXY="$fetch_proxy" HTTP_PROXY="$fetch_proxy" RICH_FORCE_TERMINAL=1 \
+                "$python_exe" -m camoufox fetch || { printf '安装 Camoufox 浏览器失败\n' >&2; exit 1; }
         else
             info 'Camoufox 浏览器已可用'
         fi
@@ -433,6 +425,20 @@ build_script_args() {
     script_args+=(--log-file "$log_file" --strict)
 }
 
+# Camoufox 启动前验证浏览器代理，避免故障代理拖垮整批任务。
+check_browser_proxy() {
+    [[ "$browser_mode" == "camoufox" && -n "$browser_proxy" ]] || return
+    command -v curl >/dev/null 2>&1 || return
+
+    local probe_proxy
+    for _ in 1 2 3; do
+        probe_proxy="${browser_proxy//\{uuid\}/$("$python_exe" -c 'import uuid; print(uuid.uuid4().hex)')}"
+        curl --silent --output /dev/null --max-time 8 --proxy "$probe_proxy" "https://chat.qwen.ai/" && return
+    done
+    printf '浏览器代理连续 3 次检测失败，停止启动，避免批量注册全部失败。\n' >&2
+    exit 1
+}
+
 # 递归终止指定进程及其子进程。
 stop_process_tree() {
     local pid="$1" child
@@ -533,6 +539,7 @@ main() {
     prompt_run_config
     save_config || exit 1
     info "已保存本次参数: $resolved_config_path"
+    $dry_run || check_browser_proxy
     build_script_args
     display_command
     if $dry_run; then

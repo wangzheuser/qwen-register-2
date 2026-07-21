@@ -6,12 +6,12 @@ import random
 import time
 
 RATE_LIMIT_MAX_RETRIES = 99
-RATE_LIMIT_MIN_DELAY_SECONDS = 0.01
-RATE_LIMIT_MAX_DELAY_SECONDS = 0.1
+RATE_LIMIT_MIN_DELAY_SECONDS = 1.0
+RATE_LIMIT_MAX_DELAY_SECONDS = 3.0
 
 
 def random_rate_limit_delay() -> float:
-    """返回 429 限流后的随机短等待秒数。"""
+    """返回 429 限流后的随机退避秒数。"""
 
     return random.uniform(RATE_LIMIT_MIN_DELAY_SECONDS, RATE_LIMIT_MAX_DELAY_SECONDS)
 

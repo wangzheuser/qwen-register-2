@@ -10,12 +10,20 @@ from email_providers import EmailProviderFactory
 from email_providers.base import EmailCreationError, EmailParseError
 from email_providers.mailporary import MailporaryProvider
 from email_providers.mailtm import MailtmProvider
-from email_providers.retry import RATE_LIMIT_MAX_RETRIES
+from email_providers.retry import (
+    RATE_LIMIT_MAX_DELAY_SECONDS,
+    RATE_LIMIT_MAX_RETRIES,
+    RATE_LIMIT_MIN_DELAY_SECONDS,
+)
 from email_providers.store import UsedEmailsStore
 from email_providers.utils import extract_activation_link
 
 def test_rate_limit_max_retries_is_ninety_nine():
     assert RATE_LIMIT_MAX_RETRIES == 99
+
+
+def test_rate_limit_delay_avoids_tight_retry_loop():
+    assert (RATE_LIMIT_MIN_DELAY_SECONDS, RATE_LIMIT_MAX_DELAY_SECONDS) == (1.0, 3.0)
 
 
 def test_extract_activation_link_prefers_qwen_verify_link_from_html():

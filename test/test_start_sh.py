@@ -58,6 +58,14 @@ class StartShTest(unittest.TestCase):
             self.assertIn("logs/qwenv4-camoufox.log", result.stdout)
             self.assertEqual(1, json.loads(config_path.read_text())["concurrency"])
 
+    def test_camoufox_checks_browser_proxy_before_registration(self) -> None:
+        """Camoufox 应在浏览器代理连续失效时停止批量任务。"""
+        source = START_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('check_browser_proxy', source)
+        self.assertIn('for _ in 1 2 3', source)
+        self.assertIn('浏览器代理连续 3 次检测失败', source)
+
     def test_camoufox_mode_rejects_incompatible_playwright(self) -> None:
         """Camoufox 模式应检测 Playwright 1.60 以上版本。"""
         source = START_SCRIPT.read_text(encoding="utf-8")
@@ -65,11 +73,13 @@ class StartShTest(unittest.TestCase):
         self.assertIn('"camoufox" in sys.argv[1:]', source)
         self.assertIn('>= (1, 60)', source)
 
-    def test_camoufox_download_can_use_configured_proxy(self) -> None:
-        """首次下载 Camoufox 时应支持复用浏览器代理。"""
+    def test_camoufox_download_uses_fixed_proxy(self) -> None:
+        """首次下载 Camoufox 时应使用固定的本机代理。"""
         source = START_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertIn("CAMOUFOX_FETCH_PROXY", source)
+        self.assertIn('local fetch_proxy="http://127.0.0.1:7890"', source)
+        self.assertIn('github_token="$(gh auth token 2>/dev/null || true)"', source)
+        self.assertIn('GITHUB_TOKEN="$github_token"', source)
         self.assertIn('HTTPS_PROXY="$fetch_proxy"', source)
 
 
