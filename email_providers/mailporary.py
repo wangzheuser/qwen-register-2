@@ -7,6 +7,7 @@ import random
 import re
 import string
 import time
+import uuid
 from typing import Any, Callable, Optional
 
 import httpx
@@ -90,7 +91,14 @@ class MailporaryProvider(EmailProvider):
     def _headers(self) -> dict[str, str]:
         if not self.token:
             self._refresh_token()
-        return {"Authorization": f"Bearer {self.token}"}
+        # Mailporary 接口已改为要求每个请求带唯一 request ID 和秒级 Unix 时间戳，
+        # 缺任一都会返回 401 missing request ID / missing timestamp；时间戳必须是秒
+        # （毫秒会被判为 future timestamp）。X-Request-ID 每次请求都要新生成。
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "X-Request-ID": uuid.uuid4().hex,
+            "X-Timestamp": str(int(time.time())),
+        }
 
     def _api_get(
         self,

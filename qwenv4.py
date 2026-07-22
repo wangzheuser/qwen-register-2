@@ -1846,10 +1846,15 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
                     current_ip, country = get_current_ip()
                     print(f"  📡 {label} 当前 IP: {current_ip} ({country})")
 
+                # 邮箱 API 复用本账号浏览器已解析好 {uuid} 的动态代理出口，
+                # 让注册与收件走同一个独立 IP，避免所有账号共用静态 api_proxy 单 IP
+                # 被临时邮箱按 IP 限流（FreeCustom 429 刷屏的根因）。未配置浏览器
+                # 代理时回退到原 api_proxy。
+                email_api_proxy = proxy_info["resolved"] or args.api_proxy
                 provider = EmailProviderFactory.create(
                     provider_type=args.email_provider,
                     verbose=args.verbose,
-                    api_proxy=args.api_proxy,
+                    api_proxy=email_api_proxy,
                     context=context,
                 )
                 stage_timer.mark("邮箱 Provider")
