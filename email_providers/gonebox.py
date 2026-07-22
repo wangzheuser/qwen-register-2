@@ -126,8 +126,14 @@ class GoneBoxProvider(EmailProvider):
                     continue
                 detail = self._get_message(message_id)
                 body = detail.get("body") if isinstance(detail.get("body"), dict) else {}
-                text = normalize_text(body.get("text") or detail.get("text") or detail.get("intro"))
-                html = normalize_text(body.get("html") or detail.get("html"))
+                # GoneBox 详情端点的正文字段是 bodyHtml/bodyText（驼峰），不是
+                # body.html/html/text；缺了它俩会导致"找到 qwen 邮件但无法解析激活链接"。
+                text = normalize_text(
+                    detail.get("bodyText") or body.get("text") or detail.get("text") or detail.get("intro")
+                )
+                html = normalize_text(
+                    detail.get("bodyHtml") or body.get("html") or detail.get("html")
+                )
                 link = extract_activation_link(html=html, text=text)
                 if link:
                     self.log_info("激活链接获取成功")

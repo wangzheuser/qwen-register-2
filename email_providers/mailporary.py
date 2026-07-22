@@ -157,6 +157,36 @@ class MailporaryProvider(EmailProvider):
         except Exception as exc:
             raise EmailCreationError(f"Mailporary 邮箱创建失败: {exc}") from exc
 
+    def _list_messages(self) -> list[dict[str, Any]]:
+        """拉取收件箱消息列表。
+
+        Mailporary 的 /mailbox/{email} 端点直接返回消息数组（空箱为 []），
+        并非 {"messages": [...]} 包裹。这里兼容两种形态：顶层数组直接用，
+        若是 dict 则回退取其 messages 字段，避免对 list 调 .get() 崩溃。
+        """
+        data = self._api_get(f"/mailbox/{self.email}").json()
+        if isinstance(data, list):
+            messages = data
+        elif isinstance(data, dict):
+            messages = data.get("messages")
+        else:
+            messages = None
+        return [item for item in messages if isinstance(item, dict)] if isinstance(messages, list) else []
+
+    def _get_message(self, message_id: str) -> dict[str, Any]:
+        """拉取单封邮件详情。
+
+        详情端点直接返回邮件对象（含 subject/from/html/text 等字段）；异常
+        情况下（如 404 返回纯文本）JSON 解析会失败，此时把原始文本兜底为正文，
+        保证解析链路不因单封邮件而中断。
+        """
+        response = self._api_get(f"/mailbox/{self.email}/{message_id}")
+        try:
+            payload = response.json()
+        except ValueError:
+            return {"text": response.text, "html": response.text}
+        return payload if isinstance(payload, dict) else {"text": normalize_text(payload)}
+
     def get_activation_link(
         self,
         timeout: int = 300,
@@ -167,15 +197,14 @@ class MailporaryProvider(EmailProvider):
         deadline = time.time() + timeout
         parse_errors: list[str] = []
         while time.time() < deadline:
-            messages = self._api_get(f"/mailbox/{self.email}").json().get("messages", [])
-            for message in messages:
+            for message in self._list_messages():
                 if not message_matches_keywords(message, keywords):
                     continue
                 message_id = message.get("id")
                 if not message_id:
                     continue
-                detail = self._api_get(f"/mailbox/{self.email}/{message_id}").json()
-                body = detail.get("body") or {}
+                detail = self._get_message(message_id)
+                body = detail.get("body") if isinstance(detail.get("body"), dict) else {}
                 text = normalize_text(body.get("text") or detail.get("text") or detail.get("intro"))
                 html = normalize_text(body.get("html") or detail.get("html"))
                 link = extract_activation_link(html=html, text=text)

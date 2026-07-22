@@ -220,6 +220,58 @@ def build_camoufox_worker_command(args, account_index, total_accounts):
     return command
 
 
+def _kill_orphan_camoufox_processes(label):
+    """清理已成孤儿的 Camoufox 进程。
+
+    worker 子进程被 taskkill /T 终止时，Camoufox 的 -contentproc 内容子进程
+    常在主进程死亡瞬间脱离进程树、reparent 成孤儿，/T 追不到而残留。残留进程
+    累积会占用 GPU/内存/窗口句柄，拖垮后续账号的 browser.new_page()（表现为
+    "新建注册页阶段无输出超时"雪崩）。
+
+    这里精准清理：只杀那些父进程（camoufox 主进程 / -parentPid 指向的进程）
+    已经死亡的 camoufox.exe，不误伤其它并发 worker 仍在正常运行的浏览器。
+    仅在 Windows 生效；其它平台由 taskkill 之外的 terminate 兜底。
+    """
+    if os.name != "nt":
+        return
+    # taskkill /T 是同步返回，但 Firefox 内容进程退出有延迟，稍等让 camoufox 主
+    # 进程先退出，孤儿判据（父进程已死）才准确。
+    time.sleep(0.5)
+    # 用一次 PowerShell 调用列出所有 camoufox.exe 的 pid 及其真实父进程状态，
+    # 再逐个终止父进程已死的孤儿。避免引入 psutil 新依赖。
+    ps_script = (
+        "$live = @{}; "
+        "Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $live[$_.Id] = $true }; "
+        "Get-CimInstance Win32_Process -Filter \"Name='camoufox.exe'\" -ErrorAction SilentlyContinue | "
+        "Where-Object { -not $live.ContainsKey([int]$_.ParentProcessId) } | "
+        "ForEach-Object { $_.ProcessId }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as e:
+        print(f"  ⚠️ {label} 扫描孤儿 Camoufox 进程失败: {e}", flush=True)
+        return
+    orphan_pids = [line.strip() for line in completed.stdout.splitlines() if line.strip().isdigit()]
+    for opid in orphan_pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", opid, "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+    if orphan_pids:
+        print(f"  🧹 {label} 已清理 {len(orphan_pids)} 个残留 Camoufox 进程", flush=True)
+
+
 def _terminate_process_tree(process, label):
     """终止 worker 子进程树，避免 Camoufox driver 残留。"""
     pid = getattr(process, "pid", None)
@@ -228,6 +280,7 @@ def _terminate_process_tree(process, label):
             process.terminate()
         except Exception:
             pass
+        _kill_orphan_camoufox_processes(label)
         return
     try:
         if os.name == "nt":
@@ -241,6 +294,8 @@ def _terminate_process_tree(process, label):
             process.terminate()
     except Exception as e:
         print(f"  ⚠️ {label} 终止 Camoufox worker 子进程失败: {e}", flush=True)
+    # taskkill /T 常漏杀已 reparent 的 Camoufox 内容进程，补一步定点清理孤儿。
+    _kill_orphan_camoufox_processes(label)
 
 
 def _camoufox_stage_idle_timeout(stage: str, default_timeout: float) -> float:
