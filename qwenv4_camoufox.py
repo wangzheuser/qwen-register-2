@@ -96,7 +96,84 @@ def _camoufox_launch_kwargs(proxy_dict):
     }
     if proxy_dict:
         kwargs["proxy"] = proxy_dict
+    # 低内存模式：Firefox 默认多内容进程 + 无上限内存缓存，单实例可占 0.5-1GB，
+    # 内存受限机器(如 16GB 仅 3GB 可用)高并发会 OOM。开启后把内容进程压到 1、
+    # 限制内存/磁盘缓存、禁 WebRTC/推送等注册用不到的组件，单实例可降到 ~300MB，
+    # 从而让 --concurrency 5 在小内存机上也能容纳。默认开启，可用
+    # CAMOUFOX_LOW_MEMORY=0 关闭。不禁用图片(滑块拼图是图片)、不改反检测相关项。
+    if os.getenv("CAMOUFOX_LOW_MEMORY", "1").strip() not in {"0", "false", "no"}:
+        kwargs["block_webrtc"] = True
+        kwargs["firefox_user_prefs"] = {
+            "dom.ipc.processCount": 1,            # 单内容进程，省最多内存
+            "browser.tabs.remote.autostart": False,
+            "browser.cache.memory.capacity": 32768,   # 内存缓存上限 32MB
+            "browser.cache.disk.enable": False,
+            "browser.sessionhistory.max_total_viewers": 0,
+            "media.peerconnection.enabled": False,
+            "browser.safebrowsing.malware.enabled": False,
+            "browser.safebrowsing.phishing.enabled": False,
+        }
     return kwargs
+
+
+def _available_memory_mb() -> float:
+    """返回系统可用物理内存(MB)。查不到时返回 inf(不阻塞)。
+
+    用 ctypes 调 Windows GlobalMemoryStatusEx，避免引入 psutil 依赖，也不起子进程。
+    """
+    if os.name != "nt":
+        return float("inf")
+    try:
+        import ctypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullAvailPhys / (1024 * 1024)
+    except Exception:
+        pass
+    return float("inf")
+
+
+# 启动一个新 Camoufox worker 前要求的最小空闲内存(MB)。单个 Camoufox(含多个
+# Firefox 内容进程)常驻约 700MB-1GB、启动峰值更高。16GB 机器基础占用约 13GB、
+# 仅 ~3GB 可用，实测同时起 5 个会打满内存导致启动卡死/OOM 雪崩。这里把阈值设为
+# 2000MB：确保放行新 worker 后系统仍留有足够内存供它启动，从而把 --concurrency 5
+# 这类超配请求在内存不足时自动降级到硬件可承受的实际并发(约 2)，而非硬塞。
+# 内存充足的机器(阈值相对总量很小)则能跑满设定并发。可用 CAMOUFOX_MIN_FREE_MEM_MB 覆盖。
+def _min_free_mem_mb() -> float:
+    try:
+        return float(os.getenv("CAMOUFOX_MIN_FREE_MEM_MB", "2000"))
+    except Exception:
+        return 2000.0
+
+
+# Camoufox 每账号是独立子进程(独立 Firefox)，并发启动时多个 Firefox 惊群争抢
+# OS 窗口/GPU 资源，__enter__() 会偶发卡死几十秒(实测 concurrency=5 头一波 5 个里
+# 2 个启动卡死 92s 被超时杀)。且启动纳入跨进程串行锁后，一个卡死会连锁堵住整条
+# 启动流水线。实测 + 硬件评估一致指向 camoufox 单机并发上限约 3(再高只增卡死不增
+# 吞吐)。playwright 模式是单进程多标签、无此惊群，故只钳 camoufox 路径。
+# 可用 CAMOUFOX_MAX_CONCURRENCY 覆盖。
+def _clamp_camoufox_concurrency(concurrency: int) -> int:
+    try:
+        cam_max = int(os.getenv("CAMOUFOX_MAX_CONCURRENCY", "3"))
+    except Exception:
+        cam_max = 3
+    cam_max = max(1, cam_max)
+    return min(concurrency, cam_max)
 
 
 def wait_for_camoufox_start_slot(label, *, stop_event=None, file_lock_timeout=0.5):
@@ -106,6 +183,9 @@ def wait_for_camoufox_start_slot(label, *, stop_event=None, file_lock_timeout=0.
     并发日志显示它可能在 slider 持锁拖动期间抢前台，导致 OS 鼠标拖到错误
     窗口。因此这里不持有跨进程文件锁，但会短暂等待 slider intent 清除后
     再放行新 worker 预热。
+
+    额外做内存自适应节流：空闲内存不足以再启一个 Camoufox 时返回 False，让
+    调用方等待已有 worker 退出释放内存后再放行，避免高并发 OOM 卡死雪崩。
     """
     from captcha_solvers.slider_lock import SliderLockTimeout
 
@@ -123,6 +203,17 @@ def wait_for_camoufox_start_slot(label, *, stop_event=None, file_lock_timeout=0.
             stop_event=stop_event,
             file_lock_timeout=file_lock_timeout,
         ):
+            # 内存门槛放在跨进程窗口锁内检查：保证同一时刻只有一个 worker 在做
+            # "查内存→决定放行"，避免多个子进程并发都读到充足内存而一起放行、
+            # 随后一起吃内存导致 OOM。不足则在锁内返回 False，调用方等待重试。
+            avail = _available_memory_mb()
+            if avail < _min_free_mem_mb():
+                print(
+                    f"  🧠 {label} 空闲内存 {avail:.0f}MB 不足({_min_free_mem_mb():.0f}MB)，"
+                    f"等待已有 worker 释放后再启动",
+                    flush=True,
+                )
+                return False
             return True
     except SliderLockTimeout:
         return False
@@ -556,11 +647,20 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
             return result(False)
         browser_cm = None
         try:
+            # Camoufox 启动 + new_page 合并进同一个跨进程前台窗口锁：
+            # 实测并发下多个独立 Camoufox 子进程同时初始化 Firefox / 建页时，
+            # browser.new_page() 会无输出卡死 45s（另一个 worker 正在启动抢占
+            # OS 窗口/GPU 资源）。进程内 RLock 拦不住跨子进程竞争，必须用跨进程
+            # 文件锁把"启动+建页"这段重操作串行化。这段很短(~10-15s)，串行它
+            # 不影响滑块阶段的并行度，却能消除 new_page 卡死雪崩。
             with acquire_camoufox_runtime_lock(f"{label} Camoufox 启动"):
                 with acquire_foreground_window_lock(label=f"{label} Camoufox 启动", stop_event=STOP_EVENT):
                     browser_cm = Camoufox(**_camoufox_launch_kwargs(proxy_dict))
                     browser = browser_cm.__enter__()
-                stage_timer.mark("浏览器启动")
+                    stage_timer.mark("浏览器启动")
+                    qwen = browser.new_page(viewport=CAMOUFOX_VIEWPORT)
+                    context = qwen.context
+                    stage_timer.mark("新建页面")
         except Exception as e:
             print(f"  ❌ {label} Camoufox 启动失败: {e}")
             print("  💡 如首次使用 Camoufox，请先运行: python -m camoufox fetch")
@@ -568,13 +668,6 @@ def _run_single_account_once(account_index, total_accounts, args, proxy_str=None
 
         try:
             try:
-                with acquire_camoufox_runtime_lock(f"{label} 新建注册页"):
-                    # Camoufox/Firefox 的 browser.new_page() 偶发卡顿几十秒。它不是 OS
-                    # 鼠标拖动，不应长时间占用前台窗口锁，否则会拖慢后续滑块队列。
-                    # 滑块阶段仍会通过 slider 文件锁 + Windows 置顶重新获取前台。
-                    qwen = browser.new_page(viewport=CAMOUFOX_VIEWPORT)
-                    context = qwen.context
-                stage_timer.mark("新建页面")
                 install_aliyun_callback_probe(qwen)
 
                 if getattr(args, "browser_proxy", "") or proxy_str:
@@ -786,6 +879,15 @@ def main():
                 sys.exit(1)
 
         os.makedirs(IMAGES_DIR, exist_ok=True)
+
+        # 钳制 camoufox 并发到单机上限，避免多 Firefox 惊群启动卡死(见函数注释)。
+        _clamped = _clamp_camoufox_concurrency(args.concurrency)
+        if _clamped < args.concurrency:
+            print(
+                f"⚠️ Camoufox 并发 {args.concurrency} 超过单机上限，"
+                f"已自动降到 {_clamped}(避免多 Firefox 惊群启动卡死)"
+            )
+            args.concurrency = _clamped
 
         print(f"\n🎯 准备使用 Camoufox 创建 {num_accounts} 个 Qwen 账号...")
         print(f"📮 邮箱服务: {args.email_provider}")

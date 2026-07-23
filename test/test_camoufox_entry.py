@@ -84,6 +84,20 @@ def test_camoufox_new_page_idle_timeout_allows_observed_slow_start(monkeypatch):
     assert qwenv4_camoufox._camoufox_stage_idle_timeout("new_page", 180) == 45
 
 
+def test_camoufox_concurrency_clamped_to_single_machine_ceiling(monkeypatch):
+    # camoufox 多子进程惊群启动卡死，单机并发上限默认 3：超配自动降级，未超配不动。
+    import qwenv4_camoufox
+
+    monkeypatch.delenv("CAMOUFOX_MAX_CONCURRENCY", raising=False)
+    assert qwenv4_camoufox._clamp_camoufox_concurrency(5) == 3
+    assert qwenv4_camoufox._clamp_camoufox_concurrency(3) == 3
+    assert qwenv4_camoufox._clamp_camoufox_concurrency(1) == 1
+    # 环境变量可覆盖上限（如多机/大内存放开）。
+    monkeypatch.setenv("CAMOUFOX_MAX_CONCURRENCY", "6")
+    assert qwenv4_camoufox._clamp_camoufox_concurrency(5) == 5
+    assert qwenv4_camoufox._clamp_camoufox_concurrency(8) == 6
+
+
 def test_camoufox_manual_timeout_cannot_be_shorter_than_captcha_wait():
     import qwenv4_camoufox
 
@@ -672,7 +686,10 @@ def test_camoufox_worker_creates_registration_page_via_browser_new_page(monkeypa
     assert seen["browser_new_page"] == {"viewport": {"width": 1280, "height": 800}}
 
 
-def test_camoufox_new_page_does_not_hold_foreground_window_lock(monkeypatch, tmp_path):
+def test_camoufox_new_page_runs_inside_foreground_window_lock(monkeypatch, tmp_path):
+    # 修复 new_page 跨子进程卡死：启动+建页整段必须在跨进程前台窗口锁内串行，
+    # 否则多个独立 Camoufox 同时建页抢 OS 窗口/GPU 资源会无输出卡死 45s。
+    # 因此这里断言 new_page 发生在窗口锁持有期间（与旧行为相反）。
     import qwenv4_camoufox
 
     lock_state = {"active": False, "new_page_inside_foreground": None}
@@ -760,7 +777,7 @@ def test_camoufox_new_page_does_not_hold_foreground_window_lock(monkeypatch, tmp
     result = qwenv4_camoufox.run_single_account(1, 1, args, None)
 
     assert result.success is True
-    assert lock_state["new_page_inside_foreground"] is False
+    assert lock_state["new_page_inside_foreground"] is True
 
 
 def test_camoufox_worker_defers_force_verify_route_to_register_flow(monkeypatch, tmp_path):
@@ -1292,6 +1309,9 @@ def test_camoufox_start_slot_waits_for_slider_intent_to_clear(monkeypatch, tmp_p
 
     monkeypatch.setattr(qwenv4_camoufox, "acquire_foreground_window_lock", fake_foreground_lock)
     monkeypatch.setattr(qwenv4_camoufox, "sleep_interruptible", fake_sleep)
+    # 固定空闲内存为充足值，让本用例只验证 slider intent 等待逻辑，
+    # 不受运行机器真实内存波动影响（否则内存不足时会误挡返回 False）。
+    monkeypatch.setattr(qwenv4_camoufox, "_available_memory_mb", lambda: float("inf"))
 
     held_lock = portalocker.Lock(str(intent_path), timeout=0)
     held_lock.acquire()
@@ -1304,6 +1324,31 @@ def test_camoufox_start_slot_waits_for_slider_intent_to_clear(monkeypatch, tmp_p
     assert result is True
     assert called["foreground"] is True
     assert called["sleep"] >= 1
+
+
+def test_camoufox_start_slot_blocks_on_low_memory(monkeypatch, tmp_path):
+    """空闲内存低于阈值时应返回 False，让调用方等待而非硬起新 worker 触发 OOM。"""
+    import qwenv4_camoufox
+
+    monkeypatch.chdir(tmp_path)
+
+    @contextmanager
+    def fake_foreground_lock(*_args, **_kwargs):
+        yield
+
+    monkeypatch.setattr(qwenv4_camoufox, "acquire_foreground_window_lock", fake_foreground_lock)
+    monkeypatch.setattr(qwenv4_camoufox, "sleep_interruptible", lambda _seconds: True)
+    # 阈值 2000MB，空闲仅 500MB → 不足，应拒绝放行。
+    monkeypatch.setattr(qwenv4_camoufox, "_available_memory_mb", lambda: 500.0)
+    monkeypatch.setattr(qwenv4_camoufox, "_min_free_mem_mb", lambda: 2000.0)
+
+    result = qwenv4_camoufox.wait_for_camoufox_start_slot(
+        "[账号 1/10]",
+        stop_event=threading.Event(),
+        file_lock_timeout=1.0,
+    )
+
+    assert result is False
 
 def test_camoufox_worker_retries_transient_verification_navigation_error(monkeypatch, tmp_path):
     import qwenv4_camoufox
